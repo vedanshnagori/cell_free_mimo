@@ -4,7 +4,7 @@ Implements the Transmit Precoding Optimization using edge QNNs
 """
 
 import numpy as np
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 from qiskit.circuit import ParameterVector
 from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes
 from qiskit_aer import AerSimulator
@@ -57,8 +57,14 @@ class EdgeQNN:
             local_channel: Channel from this AP to its assigned users
             assignment: Assignment policy for this AP
         """
-        # Extract relevant channel info
-        channel_features = np.abs(local_channel).flatten()
+        # Extract relevant channel info and convert complex to real
+        if np.iscomplexobj(local_channel):
+            channel_magnitude = np.abs(local_channel).flatten()
+            channel_phase = np.angle(local_channel).flatten()
+            channel_features = np.concatenate([channel_magnitude, channel_phase])
+        else:
+            channel_features = np.abs(local_channel).flatten()
+        
         assignment_features = assignment.flatten()
         
         # Combine features
@@ -70,8 +76,8 @@ class EdgeQNN:
         else:
             encoded = combined[:self.num_qubits]
         
-        # Normalize to [-π, π]
-        encoded = encoded * np.pi
+        # Normalize to [-π, π] and ensure real values
+        encoded = np.real(encoded) * np.pi
         
         return encoded
     
@@ -85,11 +91,15 @@ class EdgeQNN:
         
         # Encoding layer (Eq. 20 - encoding operation)
         param_dict = dict(zip(self.feature_map.parameters, input_data))
-        qc.compose(self.feature_map.assign_parameters(param_dict), inplace=True)
+        feature_circuit = self.feature_map.assign_parameters(param_dict)
+        feature_circuit = feature_circuit.decompose()
+        qc.compose(feature_circuit, inplace=True)
         
         # Variational layer (Eq. 20 - connection operation)
         param_dict = dict(zip(self.ansatz.parameters, parameters))
-        qc.compose(self.ansatz.assign_parameters(param_dict), inplace=True)
+        ansatz_circuit = self.ansatz.assign_parameters(param_dict)
+        ansatz_circuit = ansatz_circuit.decompose()
+        qc.compose(ansatz_circuit, inplace=True)
         
         # Measurements
         qc.measure_all()
@@ -111,8 +121,10 @@ class EdgeQNN:
         # Convert counts to probabilities
         total_shots = sum(counts.values())
         
-        # Initialize precoding matrix [num_antennas x num_users_assigned]
-        precoding = np.zeros((self.num_antennas, num_users_assigned), dtype=complex)
+        # Initialize precoding matrix [num_antennas x max(1, num_users_assigned)]
+        # Ensure at least 1 column even if no users assigned
+        num_cols = max(1, num_users_assigned)
+        precoding = np.zeros((self.num_antennas, num_cols), dtype=complex)
         
         # Decode measurement outcomes to precoding coefficients
         for bitstring, count in counts.items():
@@ -120,9 +132,8 @@ class EdgeQNN:
             state_int = int(bitstring[::-1], 2)
             
             # Map quantum state to precoding coefficients
-            # This is a simplified mapping
-            for ant_idx in range(min(self.num_antennas, num_users_assigned)):
-                user_idx = ant_idx % num_users_assigned
+            for ant_idx in range(self.num_antennas):
+                user_idx = ant_idx % num_cols
                 
                 # Extract phase and amplitude from quantum state
                 phase = (state_int & 0xFF) * 2 * np.pi / 256
@@ -131,10 +142,14 @@ class EdgeQNN:
                 precoding[ant_idx, user_idx] += amplitude * np.exp(1j * phase)
         
         # Normalize precoding vectors
-        for user_idx in range(num_users_assigned):
+        for user_idx in range(num_cols):
             norm = np.linalg.norm(precoding[:, user_idx])
             if norm > 1e-10:
                 precoding[:, user_idx] /= norm
+            else:
+                # If norm is too small, use random unit vector
+                precoding[:, user_idx] = np.random.randn(self.num_antennas) + 1j * np.random.randn(self.num_antennas)
+                precoding[:, user_idx] /= np.linalg.norm(precoding[:, user_idx])
         
         return precoding
     
@@ -146,18 +161,33 @@ class EdgeQNN:
         Corresponds to Eq. (16) in the paper
         """
         quality = 0.0
-        num_users_assigned = int(assignment.sum())
+        
+        # Get indices of assigned users
+        assigned_user_indices = np.where(assignment > 0.5)[0]
+        num_users_assigned = len(assigned_user_indices)
         
         if num_users_assigned == 0:
             return 0.0
         
         # Calculate achievable rate for each assigned user
-        for user_idx in range(num_users_assigned):
-            # Channel vector for this user
-            h = local_channel[:, user_idx]
+        for idx, user_idx in enumerate(assigned_user_indices):
+            # Channel vector for this user (shape: num_antennas)
+            if user_idx < local_channel.shape[1]:
+                h = local_channel[:, user_idx]
+            else:
+                continue
             
-            # Precoding vector for this user
-            v = precoding[:, user_idx]
+            # Precoding vector for this user (shape: num_antennas)
+            if idx < precoding.shape[1]:
+                v = precoding[:, idx]
+            else:
+                # Use first precoding vector if not enough
+                v = precoding[:, 0]
+            
+            # Ensure dimensions match
+            min_len = min(len(h), len(v))
+            h = h[:min_len]
+            v = v[:min_len]
             
             # Signal power
             signal_power = np.abs(np.dot(h.conj(), v)) ** 2
@@ -208,8 +238,15 @@ class EdgeQNN:
         num_params = self.ansatz.num_parameters
         self.theta_edge = np.random.uniform(0, 2*np.pi, num_params)
         
-        # Determine number of assigned users
-        num_users_assigned = int(assignment[self.ap_id].sum())
+        # Determine number of assigned users for this AP
+        if assignment.ndim == 2:
+            # assignment is [num_aps x num_users]
+            ap_assignment = assignment[self.ap_id, :]
+        else:
+            # assignment is [num_users]
+            ap_assignment = assignment
+        
+        num_users_assigned = int(ap_assignment.sum())
         
         if num_users_assigned == 0:
             print(f"  No users assigned to AP {self.ap_id}, skipping training")
@@ -232,7 +269,11 @@ class EdgeQNN:
         # Training loop (Algorithm 3, step 2)
         for iteration in range(num_iterations):
             # Encode local channel and assignment (step 3)
-            encoded_input = self.encode_local_channel(local_channel, assignment[self.ap_id])
+            if assignment.ndim == 2:
+                ap_assignment = assignment[self.ap_id, :]
+            else:
+                ap_assignment = assignment
+            encoded_input = self.encode_local_channel(local_channel, ap_assignment)
             
             # Create and run circuit (step 4)
             qc = self.create_qnn_circuit(encoded_input, self.theta_edge)
@@ -282,6 +323,7 @@ class EdgeQNN:
             theta_plus[i] += epsilon
             
             qc_plus = self.create_qnn_circuit(encoded_input, theta_plus)
+            qc_plus = transpile(qc_plus, simulator)
             result_plus = simulator.run(qc_plus, shots=self.config.SHOTS).result()
             counts_plus = result_plus.get_counts()
             precoding_plus = self.decode_precoding(counts_plus, num_users_assigned)
@@ -293,6 +335,7 @@ class EdgeQNN:
             theta_minus[i] -= epsilon
             
             qc_minus = self.create_qnn_circuit(encoded_input, theta_minus)
+            qc_minus = transpile(qc_minus, simulator)
             result_minus = simulator.run(qc_minus, shots=self.config.SHOTS).result()
             counts_minus = result_minus.get_counts()
             precoding_minus = self.decode_precoding(counts_minus, num_users_assigned)
@@ -323,6 +366,7 @@ class EdgeQNN:
         # Run circuit
         simulator = AerSimulator()
         qc = self.create_qnn_circuit(encoded_input, self.theta_edge)
+        qc = transpile(qc, simulator)
         result = simulator.run(qc, shots=self.config.SHOTS).result()
         counts = result.get_counts()
         

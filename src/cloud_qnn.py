@@ -4,12 +4,12 @@ Implements the Transmitter-User Assignment using QNN
 """
 
 import numpy as np
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 from qiskit.circuit import ParameterVector
 from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes
 from qiskit_algorithms.optimizers import COBYLA, SPSA
 from qiskit_aer import AerSimulator
-from qiskit.primitives import Sampler
+from qiskit_aer.primitives import Sampler
 from typing import Tuple, Dict
 from config import NetworkConfig, QNNConfig
 
@@ -57,14 +57,24 @@ class CloudQNN:
         Encode channel information H into quantum features
         Corresponds to Eq. (10) in the paper
         """
-        # Take first num_qubits features or pad if needed
-        if len(channel_features) < self.num_qubits:
-            encoded = np.pad(channel_features, (0, self.num_qubits - len(channel_features)))
+        # Convert complex to real by taking magnitude and phase separately
+        if np.iscomplexobj(channel_features):
+            magnitude = np.abs(channel_features)
+            phase = np.angle(channel_features)
+            # Combine magnitude and phase
+            real_features = np.concatenate([magnitude.flatten(), phase.flatten()])
         else:
-            encoded = channel_features[:self.num_qubits]
+            real_features = channel_features.flatten()
+        
+        # Take first num_qubits features or pad if needed
+        if len(real_features) < self.num_qubits:
+            encoded = np.pad(real_features, (0, self.num_qubits - len(real_features)))
+        else:
+            encoded = real_features[:self.num_qubits]
         
         # Normalize to [-π, π] for angle encoding
-        encoded = encoded * np.pi
+        # Make sure all values are real
+        encoded = np.real(encoded) * np.pi
         return encoded
     
     def create_qnn_circuit(self, input_data: np.ndarray, parameters: np.ndarray) -> QuantumCircuit:
@@ -76,11 +86,17 @@ class CloudQNN:
         
         # Encoding layer - embed classical information into Hilbert space (Eq. 11)
         param_dict = dict(zip(self.feature_map.parameters, input_data))
-        qc.compose(self.feature_map.assign_parameters(param_dict), inplace=True)
+        feature_circuit = self.feature_map.assign_parameters(param_dict)
+        # Decompose to basic gates
+        feature_circuit = feature_circuit.decompose()
+        qc.compose(feature_circuit, inplace=True)
         
         # Variational layer - parameterized quantum gates
         param_dict = dict(zip(self.ansatz.parameters, parameters))
-        qc.compose(self.ansatz.assign_parameters(param_dict), inplace=True)
+        ansatz_circuit = self.ansatz.assign_parameters(param_dict)
+        # Decompose to basic gates
+        ansatz_circuit = ansatz_circuit.decompose()
+        qc.compose(ansatz_circuit, inplace=True)
         
         # Measurements
         qc.measure_all()
@@ -204,7 +220,7 @@ class CloudQNN:
             
             # Create and run circuit
             qc = self.create_qnn_circuit(encoded_input, self.theta_cloud)
-            qc_transpiled = simulator.transpile(qc)
+            qc_transpiled = transpile(qc, simulator)
             result = simulator.run(qc_transpiled, shots=self.config.SHOTS).result()
             counts = result.get_counts()
             
@@ -250,6 +266,7 @@ class CloudQNN:
             theta_plus[i] += epsilon
             
             qc_plus = self.create_qnn_circuit(encoded_input, theta_plus)
+            qc_plus = transpile(qc_plus, simulator)
             result_plus = simulator.run(qc_plus, shots=self.config.SHOTS).result()
             counts_plus = result_plus.get_counts()
             assignment_plus = self.decode_output(counts_plus)
@@ -260,6 +277,7 @@ class CloudQNN:
             theta_minus[i] -= epsilon
             
             qc_minus = self.create_qnn_circuit(encoded_input, theta_minus)
+            qc_minus = transpile(qc_minus, simulator)
             result_minus = simulator.run(qc_minus, shots=self.config.SHOTS).result()
             counts_minus = result_minus.get_counts()
             assignment_minus = self.decode_output(counts_minus)
@@ -285,6 +303,7 @@ class CloudQNN:
         # Create and run circuit with trained parameters
         simulator = AerSimulator()
         qc = self.create_qnn_circuit(encoded_input, self.theta_cloud)
+        qc = transpile(qc, simulator)
         result = simulator.run(qc, shots=self.config.SHOTS).result()
         counts = result.get_counts()
         

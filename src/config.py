@@ -41,6 +41,8 @@ class QNNConfig:
     """Configuration for Quantum Neural Network"""
     
     # Circuit parameters
+    NUM_QUBITS_CLOUD = 8  # Number of qubits for cloud QNN
+    NUM_QUBITS_EDGE = 6   # Number of qubits for edge QNN
     ENTANGLEMENT = 'linear'  # or 'full', 'circular'
     REPS = 2  # Number of repetitions in ansatz
     
@@ -55,3 +57,5 @@ class QNNConfig:
     # Feature map
     FEATURE_MAP = 'ZZFeatureMap'  # or 'ZFeatureMap', 'PauliFeatureMap'
     
+    # Learning rate
+    LEARNING_RATE = 0.01
