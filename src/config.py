@@ -72,7 +72,7 @@ class QNNConfig:
 
     # Backend settings
     BACKEND          = 'qasm_simulator'
-    SHOTS            = 4096
+    SHOTS            = 8192
 
     # Feature map
     FEATURE_MAP      = 'ZZFeatureMap'
