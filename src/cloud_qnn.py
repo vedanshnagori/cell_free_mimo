@@ -1,313 +1,441 @@
 """
 Cloud QNN Module - Algorithm 2
-Implements the Transmitter-User Assignment using QNN
+Implements Transmitter-User Assignment using QNN
+U^cloud = U^cloud_connect(θ^cloud) · U^cloud_encode(Ĥ)  (Eq. 10)
 """
 
 import numpy as np
-from qiskit import QuantumCircuit, transpile
+from qiskit import QuantumCircuit, ClassicalRegister, transpile
 from qiskit.circuit import ParameterVector
-from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes
-from qiskit_algorithms.optimizers import COBYLA, SPSA
+from qiskit.circuit.library import (ZZFeatureMap, ZFeatureMap,
+                                     PauliFeatureMap, RealAmplitudes)
 from qiskit_aer import AerSimulator
-from qiskit_aer.primitives import Sampler
-from typing import Tuple, Dict
+from typing import Dict
 from config import NetworkConfig, QNNConfig
 
 class CloudQNN:
     """
-    Cloud QNN for transmitter-user assignment optimization
-    Implements Algorithm 2 from the paper
+    Cloud QNN for transmitter-user assignment
+    Implements Algorithm 2 from paper
     """
-    
+
     def __init__(self, num_aps: int, num_users: int, config: QNNConfig):
-        self.num_aps = num_aps
-        self.num_users = num_users
-        self.config = config
+        self.num_aps    = num_aps
+        self.num_users  = num_users
+        self.config     = config
         self.num_qubits = config.NUM_QUBITS_CLOUD
-        
-        # Initialize parameters
-        self.theta_cloud = None
-        self.trained = False
-        
-        # Setup quantum circuit
+
+        # seeded rng — consistent with NetworkConfig.RANDOM_SEED
+        self.rng = np.random.default_rng(config.RANDOM_SEED)
+
+        # Setup circuit first — needed for parameter count
         self._setup_circuit()
-        
+
+        # Initialize parameters AFTER _setup_circuit()
+        self.theta_cloud = self.rng.uniform(
+            low  = -np.pi,
+            high =  np.pi,
+            size =  self.ansatz.num_parameters
+        )
+
+        # Training state
+        self.trained          = False
+        self.current_episode  = 0
+        self.learning_rate    = config.LEARNING_RATE
+        self.training_losses  = []
+
+        # Simulator instance — reused across calls
+        self.simulator = AerSimulator()
+
+    # ── Circuit Setup ──────────────────────────────────────────────
+
     def _setup_circuit(self):
-        """Setup the quantum circuit architecture"""
-        # Feature map for encoding channel information
-        self.feature_map = ZZFeatureMap(
-            feature_dimension=self.num_qubits,
-            reps=2,
-            entanglement='linear'
+        """
+        Setup U^cloud = U^cloud_connect · U^cloud_encode
+        Eq. (10), (11), (12)
+        """
+        # feature map selection from config
+        feature_map_options = {
+            'ZZFeatureMap'   : ZZFeatureMap,
+            'ZFeatureMap'    : ZFeatureMap,
+            'PauliFeatureMap': PauliFeatureMap
+        }
+        feature_map_class = feature_map_options.get(
+            self.config.FEATURE_MAP, ZZFeatureMap
         )
-        
-        # Variational form (ansatz)
+        self.feature_map = feature_map_class(
+            feature_dimension = self.num_qubits,
+            reps              = self.config.REPS,
+            entanglement      = self.config.ENTANGLEMENT
+        )
+
+        # variational ansatz U^cloud_connect(θ^cloud) — Eq. (12)
         self.ansatz = RealAmplitudes(
-            num_qubits=self.num_qubits,
-            reps=self.config.REPS,
-            entanglement=self.config.ENTANGLEMENT
+            num_qubits   = self.num_qubits,
+            reps         = self.config.REPS,
+            entanglement = self.config.ENTANGLEMENT
         )
-        
-        # Create parameter vectors
-        self.input_params = ParameterVector('x', self.num_qubits)
-        self.weight_params = ParameterVector('θ', self.ansatz.num_parameters)
-        
-    def encode_channel_info(self, channel_features: np.ndarray) -> np.ndarray:
+
+        # validate
+        assert self.feature_map.num_parameters > 0, \
+            "Feature map has no parameters"
+        assert self.ansatz.num_parameters > 0, \
+            "Ansatz has no trainable parameters"
+
+    # ── Encoding ───────────────────────────────────────────────────
+
+    def encode_channel_info(self, channel_matrix: np.ndarray) -> np.ndarray:
         """
-        Encode channel information H into quantum features
-        Corresponds to Eq. (10) in the paper
+        Encode Ĥ = {Ĥ_m}^N_AP into quantum rotation angles
+        Implements U^cloud_encode (Eq. 11)
         """
-        # Convert complex to real by taking magnitude and phase separately
-        if np.iscomplexobj(channel_features):
-            magnitude = np.abs(channel_features)
-            phase = np.angle(channel_features)
-            # Combine magnitude and phase
-            real_features = np.concatenate([magnitude.flatten(), phase.flatten()])
+        if np.iscomplexobj(channel_matrix):
+            magnitude = np.abs(channel_matrix).flatten()
+            magnitude = magnitude / (np.max(magnitude) + 1e-10)  # → [0,1]
+
+            phase = np.angle(channel_matrix).flatten()
+            phase = phase / np.pi                                  # → [-1,1]
+
+            real_features = np.concatenate([magnitude, phase])
         else:
-            real_features = channel_features.flatten()
-        
-        # Take first num_qubits features or pad if needed
+            real_features = np.abs(channel_matrix).flatten()
+            real_features = real_features / \
+                           (np.max(real_features) + 1e-10)
+
+        # mean pooling to num_qubits
         if len(real_features) < self.num_qubits:
-            encoded = np.pad(real_features, (0, self.num_qubits - len(real_features)))
+            encoded = np.pad(
+                real_features,
+                (0, self.num_qubits - len(real_features))
+            )
         else:
-            encoded = real_features[:self.num_qubits]
-        
-        # Normalize to [-π, π] for angle encoding
-        # Make sure all values are real
+            chunk_size = max(1, len(real_features) // self.num_qubits)
+            encoded = np.array([
+                np.mean(real_features[i:i+chunk_size])
+                for i in range(0, self.num_qubits*chunk_size, chunk_size)
+            ])
+            if len(encoded) < self.num_qubits:
+                encoded = np.pad(
+                    encoded,
+                    (0, self.num_qubits - len(encoded))
+                )
+            encoded = encoded[:self.num_qubits]
+
+        # normalize then scale to rotation angles [-π, π]
+        max_val = np.max(np.abs(encoded))
+        if max_val > 1e-10:
+            encoded = encoded / max_val
         encoded = np.real(encoded) * np.pi
+
         return encoded
-    
-    def create_qnn_circuit(self, input_data: np.ndarray, parameters: np.ndarray) -> QuantumCircuit:
+
+    # ── Circuit Creation ───────────────────────────────────────────
+
+    def create_qnn_circuit(self, input_data: np.ndarray,
+                           parameters: np.ndarray) -> QuantumCircuit:
         """
-        Create the complete QNN circuit with encoding and variational layers
-        Implements U^cloud in Eq. (10)
+        Build U^cloud = U^cloud_connect(θ^cloud) · U^cloud_encode(Ĥ)
+        Implements Eq. (10)
         """
+        assert self.feature_map is not None, \
+            "feature_map is None — call _setup_circuit() first"
+        assert self.ansatz is not None, \
+            "ansatz is None — call _setup_circuit() first"
+        assert len(input_data) == len(self.feature_map.parameters), \
+            f"input_data {len(input_data)} != " \
+            f"feature_map params {len(self.feature_map.parameters)}"
+        assert len(parameters) == len(self.ansatz.parameters), \
+            f"parameters {len(parameters)} != " \
+            f"ansatz params {len(self.ansatz.parameters)}"
+
+        cr = ClassicalRegister(self.num_qubits, name='cloud_output')
         qc = QuantumCircuit(self.num_qubits)
-        
-        # Encoding layer - embed classical information into Hilbert space (Eq. 11)
-        param_dict = dict(zip(self.feature_map.parameters, input_data))
+        qc.add_register(cr)
+
+        # U^cloud_encode — Eq. (11)
+        param_dict      = dict(zip(self.feature_map.parameters, input_data))
         feature_circuit = self.feature_map.assign_parameters(param_dict)
-        # Decompose to basic gates
-        feature_circuit = feature_circuit.decompose()
+        if self.config.BACKEND != 'statevector_simulator':
+            feature_circuit = feature_circuit.decompose()
         qc.compose(feature_circuit, inplace=True)
-        
-        # Variational layer - parameterized quantum gates
-        param_dict = dict(zip(self.ansatz.parameters, parameters))
+        qc.barrier()
+
+        # U^cloud_connect(θ^cloud) — Eq. (12)
+        param_dict     = dict(zip(self.ansatz.parameters, parameters))
         ansatz_circuit = self.ansatz.assign_parameters(param_dict)
-        # Decompose to basic gates
-        ansatz_circuit = ansatz_circuit.decompose()
+        if self.config.BACKEND != 'statevector_simulator':
+            ansatz_circuit = ansatz_circuit.decompose()
         qc.compose(ansatz_circuit, inplace=True)
-        
-        # Measurements
-        qc.measure_all()
-        
+        qc.barrier()
+
+        qc.measure(range(self.num_qubits), range(self.num_qubits))
         return qc
-    
+
+    # ── Decoding ───────────────────────────────────────────────────
+
     def decode_output(self, counts: Dict[str, int]) -> np.ndarray:
         """
-        Decode quantum measurement results to assignment policy γ
-        Implements decoding step in Algorithm 2, step 5
+        Decode measurement to assignment γ ∈ {0,1}^(N_AP × N_user)
+        Implements Eq. (9): π_assign: Ĥ → γ
+        o^cloud_m ∈ [0,1] → ô_m = floor(o^cloud_m * N_user)
         """
-        # Convert counts to probabilities
         total_shots = sum(counts.values())
-        
-        # Create assignment matrix (AP x User)
-        assignment = np.zeros((self.num_aps, self.num_users))
-        
-        # Simple decoding: map measurement outcomes to assignments
-        # Use first log2(num_aps * num_users) qubits
-        for bitstring, count in counts.items():
-            prob = count / total_shots
-            # Decode bitstring to AP-User pair
-            # This is a simplified decoding scheme
-            state_int = int(bitstring[::-1], 2)  # Reverse for little-endian
-            
-            ap_idx = state_int % self.num_aps
-            user_idx = (state_int // self.num_aps) % self.num_users
-            
-            if ap_idx < self.num_aps and user_idx < self.num_users:
-                assignment[ap_idx, user_idx] += prob
-        
-        # Normalize to create valid assignment (each user assigned to exactly one AP)
-        assignment = self._normalize_assignment(assignment)
-        
-        return assignment
-    
-    def _normalize_assignment(self, assignment: np.ndarray) -> np.ndarray:
-        """Ensure each user is assigned to exactly one AP (constraint in paper)"""
-        normalized = np.zeros_like(assignment)
-        
+        assignment  = np.zeros((self.num_aps, self.num_users))
+
+        for m in range(self.num_aps):
+            # probability of qubit m being |1⟩
+            o_cloud_m = sum(
+                count / total_shots
+                for bitstring, count in counts.items()
+                if bitstring[::-1][m % self.num_qubits] == '1'
+            )
+            # decode to user index: ô_m = floor(o^cloud_m * N_user)
+            user_idx = int(np.floor(o_cloud_m * self.num_users))
+            user_idx = min(user_idx, self.num_users - 1)
+            assignment[m, user_idx] = 1.0
+
+        return self._normalize_assignment(assignment)
+
+    def _normalize_assignment(self,
+                               assignment: np.ndarray) -> np.ndarray:
+        """
+        Enforce Eq. (6c): ϱ_k ≥ 1 — each user gets at least one AP
+        Allows many-to-one: multiple APs can serve same user (Section IV-A)
+        """
+        normalized = (assignment > 0.5).astype(float)
+
+        # enforce Eq. (6c) — add r_penalty for unserved users
         for user_idx in range(self.num_users):
-            user_probs = assignment[:, user_idx]
-            if user_probs.sum() > 0:
-                # Assign user to AP with highest probability
-                best_ap = np.argmax(user_probs)
+            if normalized[:, user_idx].sum() == 0:
+                best_ap = np.argmax(assignment[:, user_idx])
                 normalized[best_ap, user_idx] = 1.0
-            else:
-                # Random assignment if no clear winner
-                random_ap = np.random.randint(0, self.num_aps)
-                normalized[random_ap, user_idx] = 1.0
-        
+
         return normalized
-    
-    def calculate_assignment_quality(self, assignment: np.ndarray, 
-                                    channel_matrix: np.ndarray) -> float:
+
+    # ── Quality and Loss ───────────────────────────────────────────
+
+    def calculate_assignment_quality(self,
+                                      assignment: np.ndarray,
+                                      channel_matrix: np.ndarray
+                                      ) -> float:
         """
-        Calculate quality metric Q_assign for the assignment
-        Corresponds to Eq. (14) in the paper
+        Compute Q_assign = -min_k R_k (Eq. 14)
+        Uses max-ratio precoding v^MR_m = ĥ*_m/||ĥ*_m|| (Section IV-A)
         """
-        quality = 0.0
-        
-        # Sum rate calculation (simplified)
-        for ap_idx in range(self.num_aps):
-            for user_idx in range(self.num_users):
-                if assignment[ap_idx, user_idx] > 0:
-                    # Channel gain from AP to user
-                    channel_gain = np.linalg.norm(channel_matrix[ap_idx, user_idx, :]) ** 2
-                    # SINR approximation
-                    sinr = channel_gain / (1 + 0.1)  # Simplified noise/interference
-                    rate = np.log2(1 + sinr)
-                    quality += assignment[ap_idx, user_idx] * rate
-        
-        return quality
-    
-    def calculate_loss(self, assignment: np.ndarray, channel_matrix: np.ndarray,
-                      target_performance: float) -> float:
+        min_rate = float('inf')
+
+        for k in range(self.num_users):
+            assigned_aps = np.where(assignment[:, k] > 0.5)[0]
+
+            if len(assigned_aps) == 0:
+                # penalty for unassigned user — Eq. (14)
+                return float(self.config.R_PENALTY)
+
+            # signal: Σ_{m∈A_k} ρ|ĥ^T_mk v^MR_m|²
+            signal = 0.0
+            for m in assigned_aps:
+                h_mk = channel_matrix[m, k, :]
+                v_mr = h_mk.conj() / (np.linalg.norm(h_mk) + 1e-10)
+                signal += self.config.SNR * \
+                          np.abs(h_mk.conj() @ v_mr) ** 2
+
+            # interference: ρ Σ_{n∉A_k} μ_nk |ĥ^T_nk v^MR_n|²
+            interference = sum(
+                self.config.INTERFERENCE_FACTOR * self.config.SNR *
+                np.linalg.norm(channel_matrix[n, k, :]) ** 2
+                for n in range(self.num_aps)
+                if assignment[n, k] < 0.5
+            )
+
+            rate     = np.log2(1 + signal / (interference + 1.0))
+            min_rate = min(min_rate, rate)
+
+        # Q_assign = -min_k R_k  (Eq. 14)
+        return -min_rate
+
+    def calculate_loss(self, assignment: np.ndarray,
+                       channel_matrix: np.ndarray) -> float:
         """
-        Calculate training loss L_assign
-        Corresponds to Eq. (13) in the paper
+        L_assign = ||Q_assign - Φ_assign||²  (Eq. 13)
+        Φ_assign = -Σ Σ log2(1 + λ^[m]_i/N_λ * ρ)  (Eq. 14)
         """
-        current_quality = self.calculate_assignment_quality(assignment, channel_matrix)
-        
-        # Loss is difference from target (reference point)
-        loss = (target_performance - current_quality) ** 2
-        
+        # current reward Q_assign
+        current_quality = self.calculate_assignment_quality(
+            assignment, channel_matrix
+        )
+
+        # target Φ_assign from eigenvalues (Eq. 14)
+        gram     = channel_matrix.reshape(-1, channel_matrix.shape[-1])
+        gram     = gram @ gram.conj().T
+        eigvals  = np.maximum(np.linalg.eigvalsh(gram), 0)
+        n_lambda = max(1, len(eigvals))
+        target   = -sum(
+            np.log2(1 + lam / (n_lambda * self.config.SNR))
+            for lam in eigvals
+        )
+
+        # L_assign = ||Q_assign - Φ_assign||²  (Eq. 13)
+        loss = (current_quality - target) ** 2
+        self.training_losses.append(float(loss))
         return loss
-    
-    def train(self, channel_data: np.ndarray, num_iterations: int = 50) -> Dict:
+
+    # ── Training ───────────────────────────────────────────────────
+
+    def train(self, channel_data: np.ndarray,
+              num_iterations: int = None) -> Dict:
         """
-        Train the Cloud QNN (Algorithm 2)
-        
-        Args:
-            channel_data: Channel matrix realizations
-            num_iterations: Number of training iterations
+        Train Cloud QNN — Algorithm 2
+        Optimizes θ^cloud for transmitter-user assignment
         """
+        num_iterations = num_iterations or self.config.NUM_ITERATIONS_CLOUD
         print("Training Cloud QNN for Transmitter-User Assignment...")
-        
-        # Initialize parameters randomly
-        num_params = self.ansatz.num_parameters
-        self.theta_cloud = np.random.uniform(0, 2*np.pi, num_params)
-        
-        # Target performance (reference point)
-        target_performance = 10.0  # Example target sum rate
-        
-        # Setup simulator
-        simulator = AerSimulator()
-        sampler = Sampler()
-        
-        # Training history
-        history = {
-            'losses': [],
-            'assignments': [],
-            'qualities': []
-        }
-        
-        # Training loop (Algorithm 2, step 3)
+
+        # only reinitialize if not already set
+        if self.theta_cloud is None:
+            self.theta_cloud = self.rng.uniform(
+                low  = -np.pi,
+                high =  np.pi,
+                size =  self.ansatz.num_parameters
+            )
+
+        history = {'losses': [], 'assignments': [], 'qualities': []}
+
         for iteration in range(num_iterations):
-            # Encode channel information (step 4)
-            channel_features = channel_data.flatten()
-            encoded_input = self.encode_channel_info(channel_features)
-            
-            # Create and run circuit
+
+            # encode Ĥ = {Ĥ_m} → rotation angles (Eq. 11)
+            encoded_input = self.encode_channel_info(channel_data)
+
+            # run U^cloud circuit
             qc = self.create_qnn_circuit(encoded_input, self.theta_cloud)
-            qc_transpiled = transpile(qc, simulator)
-            result = simulator.run(qc_transpiled, shots=self.config.SHOTS).result()
-            counts = result.get_counts()
-            
-            # Decode to get assignment policy γ (step 5)
+            if self.config.BACKEND != 'qasm_simulator':
+                qc = transpile(qc, self.simulator)
+
+            counts     = self.simulator.run(
+                qc, shots=self.config.SHOTS
+            ).result().get_counts()
+
+            # decode → γ (Eq. 9)
             assignment = self.decode_output(counts)
-            
-            # Calculate quality and loss (steps 6-7)
-            quality = self.calculate_assignment_quality(assignment, channel_data)
-            loss = self.calculate_loss(assignment, channel_data, target_performance)
-            
-            # Store history
+
+            # compute Q_assign and L_assign (Eq. 13, 14)
+            quality = self.calculate_assignment_quality(
+                assignment, channel_data
+            )
+            loss = self.calculate_loss(assignment, channel_data)
+
             history['losses'].append(loss)
             history['assignments'].append(assignment)
             history['qualities'].append(quality)
-            
-            # Parameter update (gradient-free optimization)
-            # In practice, use optimizer like COBYLA or SPSA
-            gradient_estimate = self._estimate_gradient(
-                encoded_input, channel_data, target_performance
+
+            # descending lr: μ/√(episode+1) (Section V)
+            lr       = self.config.LEARNING_RATE / \
+                       np.sqrt(self.current_episode + 1)
+            gradient = self._estimate_gradient(
+                encoded_input, channel_data
             )
-            self.theta_cloud = self.theta_cloud - self.config.LEARNING_RATE * gradient_estimate
-            
+            self.theta_cloud = self.theta_cloud - lr * gradient
+
             if iteration % 10 == 0:
-                print(f"  Iteration {iteration}: Loss = {loss:.4f}, Quality = {quality:.4f}")
-        
-        self.trained = True
+                print(f"  Iteration {iteration}: "
+                      f"Loss={loss:.4f}, "
+                      f"Quality={quality:.4f}, "
+                      f"LR={lr:.6f}")
+
+        self.trained         = True
+        self.current_episode += 1
         print("Cloud QNN training completed!")
-        
         return history
-    
-    def _estimate_gradient(self, encoded_input: np.ndarray, 
-                          channel_data: np.ndarray,
-                          target_performance: float) -> np.ndarray:
-        """Estimate gradient using parameter shift rule or finite differences"""
+
+    # ── Gradient ───────────────────────────────────────────────────
+
+    def _estimate_gradient(self, encoded_input: np.ndarray,
+                           channel_data: np.ndarray) -> np.ndarray:
+        """
+        Parameter shift rule (Appendix B):
+        ∇L = 1/(2sin(π/2)) * [L(θ+π/2) - L(θ-π/2)]
+        """
         gradient = np.zeros_like(self.theta_cloud)
-        epsilon = 0.1
-        
-        simulator = AerSimulator()
-        
+        shift    = np.pi / 2
+
         for i in range(len(self.theta_cloud)):
-            # Forward perturbation
-            theta_plus = self.theta_cloud.copy()
-            theta_plus[i] += epsilon
-            
-            qc_plus = self.create_qnn_circuit(encoded_input, theta_plus)
-            qc_plus = transpile(qc_plus, simulator)
-            result_plus = simulator.run(qc_plus, shots=self.config.SHOTS).result()
-            counts_plus = result_plus.get_counts()
-            assignment_plus = self.decode_output(counts_plus)
-            loss_plus = self.calculate_loss(assignment_plus, channel_data, target_performance)
-            
-            # Backward perturbation
-            theta_minus = self.theta_cloud.copy()
-            theta_minus[i] -= epsilon
-            
+
+            # L(θ + π/2)
+            theta_plus    = self.theta_cloud.copy()
+            theta_plus[i] += shift
+            qc_plus  = self.create_qnn_circuit(encoded_input, theta_plus)
+            counts_plus   = self.simulator.run(
+                qc_plus, shots=self.config.SHOTS
+            ).result().get_counts()
+            loss_plus = self.calculate_loss(
+                self.decode_output(counts_plus), channel_data
+            )
+
+            # L(θ - π/2)
+            theta_minus    = self.theta_cloud.copy()
+            theta_minus[i] -= shift
             qc_minus = self.create_qnn_circuit(encoded_input, theta_minus)
-            qc_minus = transpile(qc_minus, simulator)
-            result_minus = simulator.run(qc_minus, shots=self.config.SHOTS).result()
-            counts_minus = result_minus.get_counts()
-            assignment_minus = self.decode_output(counts_minus)
-            loss_minus = self.calculate_loss(assignment_minus, channel_data, target_performance)
-            
-            # Finite difference
-            gradient[i] = (loss_plus - loss_minus) / (2 * epsilon)
-        
+            counts_minus   = self.simulator.run(
+                qc_minus, shots=self.config.SHOTS
+            ).result().get_counts()
+            loss_minus = self.calculate_loss(
+                self.decode_output(counts_minus), channel_data
+            )
+
+            # parameter shift rule (Appendix B)
+            gradient[i] = (loss_plus - loss_minus) / \
+                          (2 * np.sin(shift))
+
+            # Rotosolve (Appendix B) if enabled
+            if self.config.USE_ROTOSOLVE:
+                theta_zero    = self.theta_cloud.copy()
+                theta_zero[i] = 0.0
+                counts_zero   = self.simulator.run(
+                    self.create_qnn_circuit(encoded_input, theta_zero),
+                    shots=self.config.SHOTS
+                ).result().get_counts()
+                loss_zero = self.calculate_loss(
+                    self.decode_output(counts_zero), channel_data
+                )
+                optimal   = -np.pi/2 - np.arctan2(
+                    2*loss_zero - loss_plus - loss_minus,
+                    loss_plus - loss_minus
+                )
+                gradient[i] = self.theta_cloud[i] - optimal
+
+        # gradient clipping
+        grad_norm = np.linalg.norm(gradient)
+        if grad_norm > 1.0:
+            gradient = gradient / grad_norm
+
         return gradient
-    
+
+    # ── Prediction ─────────────────────────────────────────────────
+
     def predict(self, channel_data: np.ndarray) -> np.ndarray:
         """
-        Use trained QNN to predict assignment policy
-        Deployment phase (Algorithm 1, step 9)
+        Deployment phase — Algorithm 1 step 9
+        Estimate γ using trained U^cloud(θ^cloud)
         """
         if not self.trained:
-            raise ValueError("Cloud QNN must be trained before prediction!")
-        
-        # Encode channel information
-        channel_features = channel_data.flatten()
-        encoded_input = self.encode_channel_info(channel_features)
-        
-        # Create and run circuit with trained parameters
-        simulator = AerSimulator()
+            raise ValueError(
+                "Cloud QNN must be trained before prediction"
+            )
+
+        assert self.theta_cloud is not None, \
+            "theta_cloud is None — training may have failed"
+        assert len(self.theta_cloud) == self.ansatz.num_parameters, \
+            f"theta_cloud length {len(self.theta_cloud)} != " \
+            f"ansatz parameters {self.ansatz.num_parameters}"
+
+        encoded_input = self.encode_channel_info(channel_data)
         qc = self.create_qnn_circuit(encoded_input, self.theta_cloud)
-        qc = transpile(qc, simulator)
-        result = simulator.run(qc, shots=self.config.SHOTS).result()
-        counts = result.get_counts()
-        
-        # Decode to get assignment
+
+        if self.config.BACKEND != 'qasm_simulator':
+            qc = transpile(qc, self.simulator)
+
+        counts     = self.simulator.run(
+            qc, shots=self.config.SHOTS
+        ).result().get_counts()
         assignment = self.decode_output(counts)
-        
+
         return assignment
