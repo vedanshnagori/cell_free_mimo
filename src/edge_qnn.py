@@ -557,46 +557,111 @@ class EdgeQNN:
     return history
     
     def _estimate_gradient(self, encoded_input: np.ndarray,
-                          local_channel: np.ndarray,
-                          assignment: np.ndarray,
-                          target_reward: float,
-                          num_users_assigned: int) -> np.ndarray:
-        """Estimate gradient for parameter update"""
-        gradient = np.zeros_like(self.theta_edge)
-        epsilon = 0.1
-        
-        simulator = AerSimulator()
-        
-        for i in range(len(self.theta_edge)):
-            # Forward perturbation
-            theta_plus = self.theta_edge.copy()
-            theta_plus[i] += epsilon
-            
-            qc_plus = self.create_qnn_circuit(encoded_input, theta_plus)
-            qc_plus = transpile(qc_plus, simulator)
-            result_plus = simulator.run(qc_plus, shots=self.config.SHOTS).result()
-            counts_plus = result_plus.get_counts()
-            precoding_plus = self.decode_precoding(counts_plus, num_users_assigned)
-            loss_plus = self.calculate_loss(precoding_plus, local_channel, 
-                                          assignment, target_reward)
-            
-            # Backward perturbation
-            theta_minus = self.theta_edge.copy()
-            theta_minus[i] -= epsilon
-            
-            qc_minus = self.create_qnn_circuit(encoded_input, theta_minus)
-            qc_minus = transpile(qc_minus, simulator)
-            result_minus = simulator.run(qc_minus, shots=self.config.SHOTS).result()
-            counts_minus = result_minus.get_counts()
-            precoding_minus = self.decode_precoding(counts_minus, num_users_assigned)
-            loss_minus = self.calculate_loss(precoding_minus, local_channel,
-                                           assignment, target_reward)
-            
-            # Finite difference
-            gradient[i] = (loss_plus - loss_minus) / (2 * epsilon)
-        
-        return gradient
-    
+                       local_channel: np.ndarray,
+                       assignment: np.ndarray,
+                       target_reward: float,
+                       num_users_assigned: int,
+                       all_precodings: list,
+                       all_channels: list) -> np.ndarray:
+    """
+    Estimate gradient via parameter shift rule (Appendix B)
+    ∇L(θ) = 1/(2sin(ε)) * [L(θ+ε) - L(θ-ε)]
+
+    Or Rotosolve (Appendix B) if config.USE_ROTOSOLVE:
+    θ̂_i = -π/2 - arctan((2L₀ - L₊ - L₋) / (L₊ - L₋))
+    """
+
+    gradient = np.zeros_like(self.theta_edge)
+
+    # ── Shift parameter: π/2 for exact quantum gradient ───────────
+    # Appendix B: parameter shift rule
+    shift = np.pi / 2
+
+    for i in range(len(self.theta_edge)):
+
+        # ── Forward perturbation: θ + π/2 ─────────────────────────
+        theta_plus    = self.theta_edge.copy()
+        theta_plus[i] += shift
+
+        qc_plus = self.create_qnn_circuit(encoded_input, theta_plus)
+        if self.config.BACKEND != 'qasm_simulator':
+            qc_plus = transpile(qc_plus, self.simulator)
+
+        counts_plus    = self.simulator.run(
+            qc_plus, shots=self.config.SHOTS
+        ).result().get_counts()
+        precoding_plus = self.decode_precoding(counts_plus, num_users_assigned)
+        loss_plus      = self.calculate_loss(
+            precoding      = precoding_plus,
+            local_channel  = local_channel,
+            assignment     = assignment,
+            all_precodings = all_precodings,
+            all_channels   = all_channels
+        )
+
+        # ── Backward perturbation: θ - π/2 ────────────────────────
+        theta_minus    = self.theta_edge.copy()
+        theta_minus[i] -= shift
+
+        qc_minus = self.create_qnn_circuit(encoded_input, theta_minus)
+        if self.config.BACKEND != 'qasm_simulator':
+            qc_minus = transpile(qc_minus, self.simulator)
+
+        counts_minus    = self.simulator.run(
+            qc_minus, shots=self.config.SHOTS
+        ).result().get_counts()
+        precoding_minus = self.decode_precoding(counts_minus, num_users_assigned)
+        loss_minus      = self.calculate_loss(
+            precoding      = precoding_minus,
+            local_channel  = local_channel,
+            assignment     = assignment,
+            all_precodings = all_precodings,
+            all_channels   = all_channels
+        )
+
+        # ── Gradient computation ───────────────────────────────────
+        if self.config.USE_ROTOSOLVE:
+            # Rotosolve (Appendix B):
+            # θ̂_i = -π/2 - arctan((2L₀-L₊-L₋)/(L₊-L₋))
+            theta_zero    = self.theta_edge.copy()
+            theta_zero[i] = 0.0
+
+            qc_zero = self.create_qnn_circuit(encoded_input, theta_zero)
+            counts_zero    = self.simulator.run(
+                qc_zero, shots=self.config.SHOTS
+            ).result().get_counts()
+            precoding_zero = self.decode_precoding(
+                counts_zero, num_users_assigned
+            )
+            loss_zero = self.calculate_loss(
+                precoding      = precoding_zero,
+                local_channel  = local_channel,
+                assignment     = assignment,
+                all_precodings = all_precodings,
+                all_channels   = all_channels
+            )
+
+            # optimal parameter value
+            optimal_theta = -np.pi/2 - np.arctan2(
+                2 * loss_zero - loss_plus - loss_minus,
+                loss_plus - loss_minus
+            )
+            # gradient = displacement from current to optimal
+            gradient[i] = self.theta_edge[i] - optimal_theta
+
+        else:
+            # Parameter shift rule (Appendix B):
+            # ∇L = 1/(2sin(ε)) * [L(θ+ε) - L(θ-ε)]
+            gradient[i] = (loss_plus - loss_minus) / \
+                          (2 * np.sin(shift))
+
+    # ── Gradient clipping — prevent instability ───────────────────
+    grad_norm = np.linalg.norm(gradient)
+    if grad_norm > 1.0:
+        gradient = gradient / grad_norm     # clip to unit norm
+
+    return gradient
+
     def predict(self, local_channel: np.ndarray, assignment: np.ndarray) -> np.ndarray:
         """
         Use trained edge QNN to predict precoding vectors
