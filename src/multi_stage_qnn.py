@@ -1,6 +1,6 @@
 """
 Multi-Stage QNN System - Algorithm 1
-Main implementation that orchestrates cloud and edge QNNs
+Orchestrates cloud and edge QNNs for cell-free MIMO optimization
 """
 
 import numpy as np
@@ -13,316 +13,413 @@ from edge_qnn import EdgeQNN
 
 class MultiStageQNN:
     """
-    Multi-Stage QNN System for Wireless Network Optimization
-    Implements Algorithm 1 from the paper
+    Multi-Stage QNN for Cell-Free MIMO Optimization
+    Implements Algorithm 1 from paper
     """
-    
-    def __init__(self, network_config: NetworkConfig, qnn_config: QNNConfig):
+
+    def __init__(self, network_config: NetworkConfig,
+                 qnn_config: QNNConfig):
         self.network_config = network_config
-        self.qnn_config = qnn_config
-        
-        # Initialize channel model
+        self.qnn_config     = qnn_config
+
+        # channel model — Eq. (3)
         self.channel_model = WirelessChannel(network_config)
-        
-        # Initialize Cloud QNN for transmitter-user assignment (Algorithm 2)
+
+        # Cloud QNN — Algorithm 2
         self.cloud_qnn = CloudQNN(
-            num_aps=network_config.NUM_ACCESS_POINTS,
-            num_users=network_config.NUM_USERS,
-            config=qnn_config
+            num_aps  = network_config.NUM_ACCESS_POINTS,
+            num_users= network_config.NUM_USERS,
+            config   = qnn_config
         )
-        
-        # Initialize Edge QNNs for each AP (Algorithm 3)
-        self.edge_qnns = []
-        for ap_id in range(network_config.NUM_ACCESS_POINTS):
-            edge_qnn = EdgeQNN(
-                ap_id=ap_id,
-                num_antennas=network_config.NUM_ANTENNAS,
-                config=qnn_config
+
+        # Edge QNNs — Algorithm 3, one per AP
+        self.edge_qnns = [
+            EdgeQNN(
+                ap_id        = ap_id,
+                num_antennas = network_config.NUM_ANTENNAS,
+                config       = qnn_config
             )
-            self.edge_qnns.append(edge_qnn)
-        
-        print(f"Multi-Stage QNN System initialized:")
-        print(f"  - {network_config.NUM_ACCESS_POINTS} Access Points")
-        print(f"  - {network_config.NUM_USERS} Users")
-        print(f"  - {network_config.NUM_ANTENNAS} Antennas per AP")
-        print(f"  - Cloud QNN: {qnn_config.NUM_QUBITS_CLOUD} qubits")
-        print(f"  - Edge QNN: {qnn_config.NUM_QUBITS_EDGE} qubits per AP")
-    
-    def train_cloud_qnn(self) -> Dict:
+            for ap_id in range(network_config.NUM_ACCESS_POINTS)
+        ]
+
+        print(f"Multi-Stage QNN initialized:")
+        print(f"  APs={network_config.NUM_ACCESS_POINTS}, "
+              f"Users={network_config.NUM_USERS}, "
+              f"Antennas={network_config.NUM_ANTENNAS}")
+        print(f"  Cloud QNN: {qnn_config.NUM_QUBITS_CLOUD} qubits")
+        print(f"  Edge QNN:  {qnn_config.NUM_QUBITS_EDGE} qubits per AP")
+
+        # validate NAP > Nuser (Section III requirement)
+        assert network_config.NUM_ACCESS_POINTS > network_config.NUM_USERS, \
+            f"NAP ({network_config.NUM_ACCESS_POINTS}) must be > " \
+            f"Nuser ({network_config.NUM_USERS}) per paper Section III"
+
+    # ── Phase 1: Cloud QNN Training ────────────────────────────────
+
+    def train_cloud_qnn(self) -> Tuple[Dict, np.ndarray]:
         """
-        Train Cloud QNN (Algorithm 1, step 2 + Algorithm 2)
-        Cloud QNN training with complete channel information
+        Algorithm 1 Step 2 + Algorithm 2
+        Train cloud QNN with complete network channel info Ĥ
+        Returns history and channel used for training
         """
         print("\n" + "="*70)
         print("PHASE 1: CLOUD QNN TRAINING")
         print("="*70)
-        
-        # Generate complete channel information for the network
-        # H = {H_m}_{m=1}^{N_data}
+
+        # generate Ĥ = {Ĥ_m}^N_AP — Algorithm 1 step 2
         channel_matrix = self.channel_model.generate_channel_matrix()
-        
-        print(f"Channel matrix shape: {channel_matrix.shape}")
-        print(f"  (Access Points × Users × Antennas)")
-        
-        # Train cloud QNN (Algorithm 2)
+        print(f"Channel matrix shape: {channel_matrix.shape} "
+              f"(N_AP × N_user × N_Tx)")
+
+        # Algorithm 2
         cloud_history = self.cloud_qnn.train(
-            channel_data=channel_matrix,
-            num_iterations=self.network_config.NUM_ITERATIONS_CLOUD
+            channel_data   = channel_matrix,
+            num_iterations = self.network_config.NUM_ITERATIONS_CLOUD
         )
-        
-        print("\nCloud QNN training completed successfully!")
-        return cloud_history
-    
-    def train_edge_qnns(self, assignment_policy: np.ndarray) -> List[Dict]:
+
+        print("Cloud QNN training completed!")
+        return cloud_history, channel_matrix
+
+    # ── Phase 2: Edge QNN Training ─────────────────────────────────
+
+    def train_edge_qnns(self,
+                        assignment_policy: np.ndarray) -> List[Dict]:
         """
-        Train Edge QNNs (Algorithm 1, step 3-8 + Algorithm 3)
-        Each edge trains independently with local channel information
-        
+        Algorithm 1 Steps 3-8 + Algorithm 3
+        Train each edge QNN with local channel info and cloud assignment γ
+
         Args:
-            assignment_policy: Transmitter-user assignment from cloud QNN
+            assignment_policy: γ from cloud QNN ∈ {0,1}^(N_AP × N_user)
         """
         print("\n" + "="*70)
         print("PHASE 2: EDGE QNN TRAINING")
         print("="*70)
-        
+
         edge_histories = []
-        
-        # Generate channel realizations for edge training
-        # Algorithm 1, step 3: for each iteration
-        for iteration in range(1):  # Simplified: single iteration
-            print(f"\nIteration {iteration + 1}")
-            
-            # Step 4: Each m-th edge sends channel information to cloud
-            # In practice, this is simulated locally
+
+        # Algorithm 1 Step 3: for each t ∈ {1,...,N_iteration}
+        for iteration in range(self.network_config.NUM_ITERATIONS_EDGE):
+            print(f"\nIteration {iteration + 1}/"
+                  f"{self.network_config.NUM_ITERATIONS_EDGE}")
+
+            # Step 4: each AP sends Ĥ_m to cloud
             channel_matrix = self.channel_model.generate_channel_matrix()
-            
-            # Step 6: Cloud broadcasts assignment γ to all edges
+
+            # Step 5: cloud estimates γ with optimized θ^cloud
+            assignment_policy = self.cloud_qnn.predict(channel_matrix)
+
+            # Step 6: cloud broadcasts γ to all edges
             print(f"Assignment policy shape: {assignment_policy.shape}")
-            
-            # Step 7: Each m-th edge trains its learning model
+
+            # collect all local channels for interference calculation
+            all_local_channels = [
+                channel_matrix[m, :, :].T   # (N_Tx × N_user)
+                for m in range(self.network_config.NUM_ACCESS_POINTS)
+            ]
+
+            # initialize precodings for interference (None before training)
+            current_precodings = [None] * \
+                                  self.network_config.NUM_ACCESS_POINTS
+
+            # Step 7: each m-th edge trains U^[m] (Algorithm 3)
             for ap_id in range(self.network_config.NUM_ACCESS_POINTS):
                 print(f"\n--- Training Edge QNN for AP {ap_id} ---")
-                
-                # Extract local channel information H_m for this AP
-                local_channel = channel_matrix[ap_id, :, :]
-                
-                # Train edge QNN (Algorithm 3)
+
+                # local channel h_m: shape (N_Tx × N_user)
+                local_channel = channel_matrix[ap_id, :, :].T
+
                 history = self.edge_qnns[ap_id].train(
-                    local_channel=local_channel,
-                    assignment=assignment_policy,
-                    num_iterations=self.network_config.NUM_ITERATIONS_EDGE
+                    local_channel  = local_channel,
+                    assignment     = assignment_policy,
+                    all_precodings = current_precodings,
+                    all_channels   = all_local_channels
                 )
-                
                 edge_histories.append(history)
-        
+
+                # update precodings for subsequent APs
+                current_precodings[ap_id] = \
+                    self.edge_qnns[ap_id].predict(
+                        local_channel, assignment_policy
+                    )
+
         print("\n" + "="*70)
-        print("All Edge QNNs trained successfully!")
+        print("All Edge QNNs trained!")
         print("="*70)
         return edge_histories
-    
+
+    # ── Phase 3: Deployment ────────────────────────────────────────
+
     def deploy(self) -> Tuple[np.ndarray, List[np.ndarray], Dict]:
         """
-        Deployment phase (Algorithm 1, step 9)
-        Use trained QNNs for real-time operation
+        Algorithm 1 Step 9 — Deployment phase
+        Use trained U^cloud and U^[m] for real-time inference
         """
         print("\n" + "="*70)
         print("PHASE 3: DEPLOYMENT")
         print("="*70)
-        
-        # Acquire instantaneous channel information H
+
+        # acquire instantaneous Ĥ
         current_channel = self.channel_model.generate_channel_matrix()
-        print("Acquired instantaneous channel information")
-        
-        # Step 9a: Cloud employs U^cloud to estimate assignment γ
+
+        # Step 9a: cloud estimates γ with trained U^cloud(θ^cloud)
         assignment = self.cloud_qnn.predict(current_channel)
-        print(f"\nPredicted assignment policy:")
-        print(assignment)
-        print(f"Assignment shape: {assignment.shape}")
-        
-        # Step 9b: Each m-th AP employs U^[m] to estimate precoding v_m
-        precoding_vectors = []
+        print(f"Assignment policy:\n{assignment}")
+
+        # collect all channels for interference
+        all_channels = [
+            current_channel[m, :, :].T
+            for m in range(self.network_config.NUM_ACCESS_POINTS)
+        ]
+
+        # Step 9b: each AP estimates v_m with trained U^[m](θ^[m])
+        precoding_vectors = [None] * self.network_config.NUM_ACCESS_POINTS
+
         for ap_id in range(self.network_config.NUM_ACCESS_POINTS):
-            local_channel = current_channel[ap_id, :, :]
-            
-            precoding = self.edge_qnns[ap_id].predict(local_channel, assignment)
-            precoding_vectors.append(precoding)
-            
-            print(f"\nAP {ap_id} precoding vector shape: {precoding.shape}")
-        
-        # Calculate system performance
+            local_channel = current_channel[ap_id, :, :].T
+
+            precoding_vectors[ap_id] = self.edge_qnns[ap_id].predict(
+                local_channel = local_channel,
+                assignment    = assignment
+            )
+            print(f"AP {ap_id} precoding shape: "
+                  f"{precoding_vectors[ap_id].shape}")
+
+        # evaluate performance
         performance = self._calculate_system_performance(
             current_channel, assignment, precoding_vectors
         )
-        
+
         print("\n" + "="*70)
         print("DEPLOYMENT RESULTS")
         print("="*70)
-        print(f"Total Sum Rate: {performance['sum_rate']:.4f} bits/s/Hz")
-        print(f"Average SINR: {performance['avg_sinr']:.4f} dB")
+        print(f"Sum Rate:     {performance['sum_rate']:.4f} bits/s/Hz")
+        print(f"Min Rate:     {performance['min_rate']:.4f} bits/s/Hz")
+        print(f"Avg SINR:     {performance['avg_sinr']:.4f} dB")
         print(f"Active Users: {performance['active_users']}")
         print("="*70)
-        
+
         return assignment, precoding_vectors, performance
-    
-    def _calculate_system_performance(self, channel_matrix: np.ndarray,
-                                     assignment: np.ndarray,
-                                     precoding_vectors: List[np.ndarray]) -> Dict:
-        """Calculate overall system performance metrics"""
-        sum_rate = 0.0
-        sinr_values = []
+
+    # ── Performance Evaluation ─────────────────────────────────────
+
+    def _calculate_system_performance(self,
+                                       channel_matrix: np.ndarray,
+                                       assignment: np.ndarray,
+                                       precoding_vectors: List[np.ndarray]
+                                       ) -> Dict:
+        """
+        Compute sum rate and min rate per Eq. (5)
+        Includes inter-AP interference term
+        """
+        user_rates   = []
+        sinr_values  = []
         active_users = 0
-        
-        for user_idx in range(self.network_config.NUM_USERS):
-            # Find which AP serves this user
-            serving_ap = np.argmax(assignment[:, user_idx])
-            
-            if assignment[serving_ap, user_idx] > 0:
-                active_users += 1
-                
-                # Channel from serving AP to user
-                h = channel_matrix[serving_ap, user_idx, :]
-                
-                # Precoding vector (find user index in precoding matrix)
-                user_local_idx = 0  # Simplified indexing
-                if precoding_vectors[serving_ap].shape[1] > user_local_idx:
-                    v = precoding_vectors[serving_ap][:, user_local_idx]
-                    
-                    # Signal power
-                    signal_power = np.abs(np.dot(h.conj(), v)) ** 2
-                    
-                    # Noise power (simplified)
-                    noise_power = 10 ** (self.network_config.NOISE_POWER_DBM / 10) / 1000
-                    
-                    # Calculate SINR
-                    sinr = signal_power / noise_power
-                    sinr_db = 10 * np.log10(sinr + 1e-10)
-                    sinr_values.append(sinr_db)
-                    
-                    # Rate
-                    rate = np.log2(1 + sinr)
-                    sum_rate += rate
-        
-        avg_sinr = np.mean(sinr_values) if sinr_values else 0.0
-        
+
+        for k in range(self.network_config.NUM_USERS):
+
+            # all APs serving user k (many-to-one)
+            serving_aps = np.where(assignment[:, k] > 0.5)[0]
+            if len(serving_aps) == 0:
+                continue
+
+            active_users += 1
+
+            # ── Signal: Σ_{m∈A_k} ρ|h^T_mk v_m|²  (Eq. 5) ────────
+            signal = 0.0
+            for m in serving_aps:
+                h_mk = channel_matrix[m, k, :]
+                if (precoding_vectors[m] is not None and
+                        precoding_vectors[m].shape[1] > 0):
+                    v_m   = precoding_vectors[m][:, 0]
+                    min_l = min(len(h_mk), len(v_m))
+                    signal += (self.network_config.SNR *
+                               np.abs(h_mk[:min_l].conj() @
+                                      v_m[:min_l]) ** 2)
+
+            # ── Interference: ρ Σ_{n∉A_k} μ|h^T_nk v_n|²  (Eq. 5) ─
+            interference = 0.0
+            for n in range(self.network_config.NUM_ACCESS_POINTS):
+                if (assignment[n, k] < 0.5 and
+                        precoding_vectors[n] is not None):
+                    h_nk  = channel_matrix[n, k, :]
+                    v_n   = precoding_vectors[n][:, 0]
+                    min_l = min(len(h_nk), len(v_n))
+                    interference += (
+                        self.network_config.INTERFERENCE_FACTOR *
+                        self.network_config.SNR *
+                        np.abs(h_nk[:min_l].conj() @
+                               v_n[:min_l]) ** 2
+                    )
+
+            # ── SINR and Rate  (Eq. 5) ─────────────────────────────
+            noise  = self.network_config.NOISE_POWER_LINEAR
+            sinr   = signal / (interference + noise)
+            rate   = np.log2(1 + sinr)
+
+            user_rates.append(rate)
+            sinr_values.append(10 * np.log10(sinr + 1e-10))
+
         return {
-            'sum_rate': sum_rate,
-            'avg_sinr': avg_sinr,
+            'sum_rate'   : float(np.sum(user_rates)),
+            'min_rate'   : float(np.min(user_rates))
+                           if user_rates else 0.0,   # max-min objective
+            'avg_sinr'   : float(np.mean(sinr_values))
+                           if sinr_values else 0.0,
             'active_users': active_users,
+            'user_rates' : user_rates,
             'sinr_values': sinr_values
         }
-    
+
+    # ── Full Pipeline ──────────────────────────────────────────────
+
     def run_complete_pipeline(self) -> Dict:
         """
-        Run the complete multi-stage QNN pipeline
-        Implements full Algorithm 1
+        Full Algorithm 1 execution:
+        Phase 1: Cloud QNN training
+        Phase 2: Edge QNN training
+        Phase 3: Deployment
         """
         print("\n" + "#"*70)
-        print("#" + " "*68 + "#")
         print("#" + " "*15 + "MULTI-STAGE QNN OPTIMIZATION" + " "*25 + "#")
-        print("#" + " "*68 + "#")
         print("#"*70)
-        
-        # Phase 1: Train Cloud QNN
-        cloud_history = self.train_cloud_qnn()
-        
-        # Get trained assignment policy
-        channel_matrix = self.channel_model.generate_channel_matrix()
+
+        # Phase 1: train cloud QNN + reuse channel
+        cloud_history, channel_matrix = self.train_cloud_qnn()
+
+        # get assignment from trained cloud — reuse same channel
         assignment_policy = self.cloud_qnn.predict(channel_matrix)
-        
-        # Phase 2: Train Edge QNNs
+
+        # Phase 2: train edge QNNs
         edge_histories = self.train_edge_qnns(assignment_policy)
-        
-        # Phase 3: Deployment
+
+        # Phase 3: deploy
         assignment, precoding_vectors, performance = self.deploy()
-        
-        # Compile results
+
         results = {
-            'cloud_history': cloud_history,
-            'edge_histories': edge_histories,
+            'cloud_history'   : cloud_history,
+            'edge_histories'  : edge_histories,
             'final_assignment': assignment,
-            'final_precoding': precoding_vectors,
-            'performance': performance,
-            'network_info': self.channel_model.get_network_info()
+            'final_precoding' : precoding_vectors,
+            'performance'     : performance,
+            'network_info'    : self.channel_model.get_network_info()
         }
-        
+
         print("\n" + "#"*70)
-        print("#" + " "*68 + "#")
         print("#" + " "*20 + "PIPELINE COMPLETED!" + " "*28 + "#")
-        print("#" + " "*68 + "#")
         print("#"*70)
-        
         return results
-    
-    def visualize_results(self, results: Dict, save_path: str = None):
-        """Visualize the optimization results"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        
-        # Plot 1: Network Topology
-        ax = axes[0, 0]
-        network_info = results['network_info']
-        ap_positions = network_info['ap_positions']
+
+    # ── Visualization ──────────────────────────────────────────────
+
+    def visualize_results(self, results: Dict,
+                          save_path: str = None):
+        """
+        Reproduce paper figures:
+        Fig. 4: Sum rate, Fig. 5: Cloud loss, Fig. 6: Edge loss
+        """
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+        network_info   = results['network_info']
+        ap_positions   = network_info['ap_positions']
         user_positions = network_info['user_positions']
-        
-        ax.scatter(ap_positions[:, 0], ap_positions[:, 1], 
-                  c='red', s=200, marker='^', label='Access Points', edgecolors='black')
+        assignment     = results['final_assignment']
+
+        # ── Plot 1: Network Topology ───────────────────────────────
+        ax = axes[0, 0]
+        ax.scatter(ap_positions[:, 0], ap_positions[:, 1],
+                   c='red', s=200, marker='^',
+                   label='APs', edgecolors='black')
         ax.scatter(user_positions[:, 0], user_positions[:, 1],
-                  c='blue', s=100, marker='o', label='Users', edgecolors='black')
-        
-        # Draw assignment connections
-        assignment = results['final_assignment']
-        for ap_idx in range(len(ap_positions)):
-            for user_idx in range(len(user_positions)):
-                if assignment[ap_idx, user_idx] > 0.5:
-                    ax.plot([ap_positions[ap_idx, 0], user_positions[user_idx, 0]],
-                           [ap_positions[ap_idx, 1], user_positions[user_idx, 1]],
-                           'g--', alpha=0.5, linewidth=2)
-        
-        ax.set_xlabel('X Position (m)')
-        ax.set_ylabel('Y Position (m)')
-        ax.set_title('Network Topology and User Assignment')
+                   c='blue', s=100, marker='o',
+                   label='Users', edgecolors='black')
+        for m in range(len(ap_positions)):
+            for k in range(len(user_positions)):
+                if assignment[m, k] > 0.5:
+                    ax.plot(
+                        [ap_positions[m,0], user_positions[k,0]],
+                        [ap_positions[m,1], user_positions[k,1]],
+                        'g--', alpha=0.5, linewidth=2
+                    )
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title('Network Topology and Assignment')
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
-        # Plot 2: Cloud QNN Training Loss
+
+        # ── Plot 2: Cloud QNN Loss (Fig. 5) ───────────────────────
         ax = axes[0, 1]
-        cloud_losses = results['cloud_history']['losses']
-        ax.plot(cloud_losses, 'b-', linewidth=2)
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
-        ax.set_title('Cloud QNN Training Loss')
+        ax.plot(results['cloud_history']['losses'],
+                'b-', linewidth=2, label='Cloud QNN')
+        ax.set_xlabel('Training Episode')
+        ax.set_ylabel('Loss $L_{assign}$')
+        ax.set_title('Cloud QNN Training Loss (Fig. 5)')
+        ax.legend()
         ax.grid(True, alpha=0.3)
-        
-        # Plot 3: Assignment Matrix Heatmap
+
+        # ── Plot 3: Edge QNN Loss (Fig. 6) ────────────────────────
+        ax = axes[0, 2]
+        valid = [h for h in results['edge_histories']
+                 if len(h['losses']) > 0]
+        if valid:
+            max_len = max(len(h['losses']) for h in valid)
+            avg_losses = [
+                np.mean([h['losses'][i] for h in valid
+                         if len(h['losses']) > i])
+                for i in range(max_len)
+            ]
+            ax.plot(avg_losses, 'r-', linewidth=2,
+                    label='Edge QNN (avg)')
+        ax.set_xlabel('Training Episode')
+        ax.set_ylabel('Loss $L_{precode}$')
+        ax.set_title('Edge QNN Training Loss (Fig. 6)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # ── Plot 4: Assignment Matrix Heatmap ──────────────────────
         ax = axes[1, 0]
         im = ax.imshow(assignment, cmap='YlOrRd', aspect='auto')
         ax.set_xlabel('User Index')
         ax.set_ylabel('AP Index')
-        ax.set_title('Final Assignment Policy Matrix')
+        ax.set_title('Assignment Policy γ')
         plt.colorbar(im, ax=ax)
-        
-        # Plot 4: Performance Metrics
+
+        # ── Plot 5: User Rates (max-min objective Fig. 4) ─────────
         ax = axes[1, 1]
-        metrics = ['Sum Rate\n(bits/s/Hz)', 'Avg SINR\n(dB)', 'Active\nUsers']
-        values = [
+        user_rates = results['performance'].get('user_rates', [])
+        if user_rates:
+            ax.bar(range(len(user_rates)), user_rates,
+                   color='steelblue', alpha=0.7)
+            ax.axhline(y=min(user_rates), color='red',
+                       linestyle='--', label=f"Min rate={min(user_rates):.2f}")
+        ax.set_xlabel('User Index')
+        ax.set_ylabel('Rate (bits/s/Hz)')
+        ax.set_title('Per-User Rates (Max-Min Objective)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # ── Plot 6: Performance Summary ────────────────────────────
+        ax = axes[1, 2]
+        metrics = ['Sum Rate\n(bits/s/Hz)', 'Min Rate\n(bits/s/Hz)',
+                   'Avg SINR\n(dB)', 'Active\nUsers']
+        values  = [
             results['performance']['sum_rate'],
+            results['performance']['min_rate'],
             results['performance']['avg_sinr'],
             results['performance']['active_users']
         ]
-        bars = ax.bar(metrics, values, color=['green', 'orange', 'blue'], alpha=0.7)
-        ax.set_ylabel('Value')
+        bars = ax.bar(metrics, values,
+                      color=['green','red','orange','blue'],
+                      alpha=0.7)
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., h,
+                    f'{h:.2f}', ha='center', va='bottom')
         ax.set_title('System Performance Metrics')
         ax.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{height:.2f}', ha='center', va='bottom')
-        
+
         plt.tight_layout()
-        
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"\nVisualization saved to: {save_path}")
-        
+            print(f"Visualization saved to: {save_path}")
+
         return fig
