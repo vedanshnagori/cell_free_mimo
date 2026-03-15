@@ -45,21 +45,50 @@ class EdgeQNN:
     self.training_losses = []
         
     def _setup_circuit(self):
-        """Setup the quantum circuit for edge QNN"""
-        # Feature map for encoding local channel information
-        self.feature_map = ZZFeatureMap(
-            feature_dimension=self.num_qubits,
-            reps=2,
-            entanglement='linear'
-        )
-        
-        # Variational form
-        self.ansatz = RealAmplitudes(
-            num_qubits=self.num_qubits,
-            reps=self.config.REPS,
-            entanglement=self.config.ENTANGLEMENT
-        )
-        
+    """
+    Setup the quantum circuit for edge QNN
+    Implements U^[m] = U^[m]_connect · U^[m]_encode (Eq. 19)
+    Edge QNN requires Nuser qubits (Lemma 1)
+    """
+
+    # Validate qubit count matches Lemma 1
+    # U^[m]_connect requires Nuser qubits
+    assert self.num_qubits == self.config.NUM_QUBITS_EDGE, \
+        f"Edge qubit count {self.num_qubits} != " \
+        f"config {self.config.NUM_QUBITS_EDGE} (Lemma 1: needs Nuser qubits)"
+
+    # ── Feature map selection from config ──────────────────────────
+    # U^[m]_encode: encodes {h_m,k, γ_m} into Hilbert space (Eq. 19)
+    feature_map_options = {
+        'ZZFeatureMap'   : ZZFeatureMap,
+        'ZFeatureMap'    : ZFeatureMap,
+        'PauliFeatureMap': PauliFeatureMap
+    }
+    feature_map_class = feature_map_options.get(
+        self.config.FEATURE_MAP,
+        ZZFeatureMap                    # default fallback
+    )
+    self.feature_map = feature_map_class(
+        feature_dimension = self.num_qubits,
+        reps              = self.config.REPS,        # ✅ from config
+        entanglement      = self.config.ENTANGLEMENT # ✅ from config
+    )
+
+    # ── Variational ansatz ─────────────────────────────────────────
+    # U^[m]_connect(θ^[m]): trainable RY rotations + CZ entangling
+    # corresponds to Eq. (20) in paper
+    self.ansatz = RealAmplitudes(
+        num_qubits   = self.num_qubits,
+        reps         = self.config.REPS,             # ✅ from config
+        entanglement = self.config.ENTANGLEMENT      # ✅ from config
+    )
+
+    # ── Validate circuit setup ─────────────────────────────────────
+    assert self.feature_map.num_parameters > 0, \
+        "Feature map has no parameters — check feature_dimension and reps"
+    assert self.ansatz.num_parameters > 0, \
+        "Ansatz has no trainable parameters — check num_qubits and reps"
+
     def encode_local_channel(self, local_channel: np.ndarray, 
                             assignment: np.ndarray) -> np.ndarray:
         """
