@@ -434,89 +434,127 @@ class EdgeQNN:
 
     return loss
     
-    def train(self, local_channel: np.ndarray, assignment: np.ndarray,
-             num_iterations: int = 30) -> Dict:
-        """
-        Train the Edge QNN for this AP (Algorithm 3)
-        
-        Args:
-            local_channel: Local channel information for this AP
-            assignment: Assignment policy γ from cloud QNN
-            num_iterations: Number of training iterations
-        """
-        print(f"Training Edge QNN for AP {self.ap_id}...")
-        
-        # Initialize parameters
-        num_params = self.ansatz.num_parameters
-        self.theta_edge = np.random.uniform(0, 2*np.pi, num_params)
-        
-        # Determine number of assigned users for this AP
-        if assignment.ndim == 2:
-            # assignment is [num_aps x num_users]
-            ap_assignment = assignment[self.ap_id, :]
-        else:
-            # assignment is [num_users]
-            ap_assignment = assignment
-        
-        num_users_assigned = int(ap_assignment.sum())
-        
-        if num_users_assigned == 0:
-            print(f"  No users assigned to AP {self.ap_id}, skipping training")
-            self.trained = True
-            return {'losses': [], 'qualities': []}
-        
-        # Target reward
-        target_reward = 5.0 * num_users_assigned
-        
-        # Setup simulator
-        simulator = AerSimulator()
-        
-        # Training history
-        history = {
-            'losses': [],
-            'qualities': [],
-            'precodings': []
-        }
-        
-        # Training loop (Algorithm 3, step 2)
-        for iteration in range(num_iterations):
-            # Encode local channel and assignment (step 3)
-            if assignment.ndim == 2:
-                ap_assignment = assignment[self.ap_id, :]
-            else:
-                ap_assignment = assignment
-            encoded_input = self.encode_local_channel(local_channel, ap_assignment)
-            
-            # Create and run circuit (step 4)
-            qc = self.create_qnn_circuit(encoded_input, self.theta_edge)
-            result = simulator.run(qc, shots=self.config.SHOTS).result()
-            counts = result.get_counts()
-            
-            # Decode to get precoding v_m (step 4)
-            precoding = self.decode_precoding(counts, num_users_assigned)
-            
-            # Calculate quality and loss (step 5)
-            quality = self.calculate_precoding_quality(precoding, local_channel, assignment)
-            loss = self.calculate_loss(precoding, local_channel, assignment, target_reward)
-            
-            # Store history
-            history['losses'].append(loss)
-            history['qualities'].append(quality)
-            history['precodings'].append(precoding)
-            
-            # Parameter update (step 6)
-            gradient = self._estimate_gradient(
-                encoded_input, local_channel, assignment, target_reward, num_users_assigned
-            )
-            self.theta_edge = self.theta_edge - self.config.LEARNING_RATE * gradient
-            
-            if iteration % 10 == 0:
-                print(f"  Iteration {iteration}: Loss = {loss:.4f}, Quality = {quality:.4f}")
-        
+    def train(self, local_channel: np.ndarray,
+          assignment: np.ndarray,
+          all_precodings: list,
+          all_channels: list,
+          num_iterations: int = None) -> Dict:
+    """
+    Train Edge QNN for this AP
+    Implements Algorithm 3 from paper
+
+    Args:
+        local_channel:  h_m ∈ C^(N_Tx × N_user)
+        assignment:     γ from cloud QNN ∈ {0,1}^(N_AP × N_user)
+        all_precodings: {v_n} neighboring AP precodings (interference)
+        all_channels:   {h_n} neighboring AP channels   (interference)
+        num_iterations: overrides config.NUM_ITERATIONS_EDGE if provided
+    """
+
+    # ── Config-driven iteration count ─────────────────────────────
+    num_iterations = num_iterations or self.config.NUM_ITERATIONS_EDGE
+    print(f"Training Edge QNN for AP {self.ap_id}...")
+
+    # ── Parameter initialization (only if not already set) ────────
+    if self.theta_edge is None:
+        rng = np.random.default_rng(self.config.RANDOM_SEED)
+        self.theta_edge = rng.uniform(
+            low  = -np.pi,
+            high =  np.pi,
+            size =  self.ansatz.num_parameters
+        )
+
+    # ── Extract this AP's assignment row ──────────────────────────
+    ap_assignment = (assignment[self.ap_id, :]
+                     if assignment.ndim == 2
+                     else assignment)
+
+    num_users_assigned = int(ap_assignment.sum())
+
+    if num_users_assigned == 0:
+        print(f"  No users assigned to AP {self.ap_id}, skipping")
         self.trained = True
-        print(f"Edge QNN training completed for AP {self.ap_id}!")
-        
-        return history
+        return {'losses': [], 'qualities': []}
+
+    # ── Target reward: Φ_precode from Eq. (18) ────────────────────
+    # Φ_precode = -Σ log2(1 + λ^[m]_i / N_λ * ρ)
+    gram_matrix   = local_channel @ local_channel.conj().T
+    eigenvalues   = np.maximum(np.linalg.eigvalsh(gram_matrix), 0)
+    n_lambda      = max(1, len(eigenvalues))
+    target_reward = -sum(
+        np.log2(1 + lam / (n_lambda * self.config.SNR))
+        for lam in eigenvalues
+    )
+
+    # ── Store neighboring info for interference calculation ────────
+    self.all_precodings = all_precodings
+    self.all_channels   = all_channels
+
+    # ── Training history ───────────────────────────────────────────
+    history = {'losses': [], 'qualities': [], 'precodings': []}
+
+    # ── Algorithm 3 training loop ──────────────────────────────────
+    for iteration in range(num_iterations):
+
+        # Step 3: encode {h_m, γ_m} → rotation angles
+        encoded_input = self.encode_local_channel(
+            local_channel, ap_assignment
+        )
+
+        # Step 4: run circuit U^[m] → counts → v_m
+        qc = self.create_qnn_circuit(encoded_input, self.theta_edge)
+        result   = self.simulator.run(
+            qc, shots=self.config.SHOTS
+        ).result()
+        counts   = result.get_counts()
+        precoding = self.decode_precoding(counts, num_users_assigned)
+
+        # Step 5: compute Q^[m]_precode and L_precode (Eq. 16, 17)
+        quality = self.calculate_precoding_quality(
+            precoding           = precoding,
+            local_channel       = local_channel,
+            assignment          = ap_assignment,
+            all_precodings      = all_precodings,
+            all_channels        = all_channels,
+            interference_factor = self.config.INTERFERENCE_FACTOR,
+            snr                 = self.config.SNR
+        )
+        loss = self.calculate_loss(
+            precoding      = precoding,
+            local_channel  = local_channel,
+            assignment     = ap_assignment,
+            all_precodings = all_precodings,
+            all_channels   = all_channels
+        )
+
+        # store history
+        history['losses'].append(loss)
+        history['qualities'].append(quality)
+        history['precodings'].append(precoding)
+
+        # Step 6: parameter shift gradient + descending lr update
+        # μ_itrain = μ / √(i_episode + 1)  (Section V)
+        lr       = self.config.LEARNING_RATE / \
+                   np.sqrt(self.current_episode + 1)
+        gradient = self._estimate_gradient(
+            encoded_input, local_channel, ap_assignment,
+            target_reward, num_users_assigned,
+            all_precodings, all_channels
+        )
+        self.theta_edge = self.theta_edge - lr * gradient
+
+        if iteration % 10 == 0:
+            print(f"  Iteration {iteration}: "
+                  f"Loss={loss:.4f}, "
+                  f"Quality={quality:.4f}, "
+                  f"LR={lr:.6f}")
+
+    # ── Update state ───────────────────────────────────────────────
+    self.trained          = True
+    self.current_episode += 1           # increment for lr decay
+    print(f"Edge QNN training completed for AP {self.ap_id}!")
+
+    return history
     
     def _estimate_gradient(self, encoded_input: np.ndarray,
                           local_channel: np.ndarray,
