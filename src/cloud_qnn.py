@@ -196,19 +196,31 @@ class CloudQNN:
 
         return self._normalize_assignment(assignment)
 
-    def _normalize_assignment(self,
-                               assignment: np.ndarray) -> np.ndarray:
-        """
-        Enforce Eq. (6c): ϱ_k ≥ 1 — each user gets at least one AP
-        Allows many-to-one: multiple APs can serve same user (Section IV-A)
-        """
-        normalized = (assignment > 0.5).astype(float)
+    def _normalize_assignment(self, assignment: np.ndarray) -> np.ndarray:
+    """
+    Enforce Eq. (6c): each user gets at least one AP
+    But limit max APs per user to avoid imbalance
+    """
+        normalized = np.zeros_like(assignment)
 
-        # enforce Eq. (6c) — add r_penalty for unserved users
-        for user_idx in range(self.num_users):
-            if normalized[:, user_idx].sum() == 0:
-                best_ap = np.argmax(assignment[:, user_idx])
-                normalized[best_ap, user_idx] = 1.0
+        # max APs per user = NAP / Nuser  (balanced distribution)
+        max_aps_per_user = max(1, self.num_aps // self.num_users)
+
+        for k in range(self.num_users):
+            user_probs = assignment[:, k]
+
+            # get top-k APs by probability
+            top_aps = np.argsort(user_probs)[::-1][:max_aps_per_user]
+
+            # assign only if probability above threshold
+            for ap in top_aps:
+                if user_probs[ap] > 0.5:
+                    normalized[ap, k] = 1.0
+
+            # enforce Eq. (6c): at least one AP per user
+            if normalized[:, k].sum() == 0:
+                best_ap = np.argmax(user_probs)
+                normalized[best_ap, k] = 1.0
 
         return normalized
 
