@@ -153,56 +153,70 @@ class EdgeQNN:
         
         return precoding
     
-    def calculate_precoding_quality(self, precoding: np.ndarray,
-                                   local_channel: np.ndarray,
-                                   assignment: np.ndarray) -> float:
-        """
-        Calculate quality Q_precode for the precoding vectors
-        Corresponds to Eq. (16) in the paper
-        """
-        quality = 0.0
-        
-        # Get indices of assigned users
-        assigned_user_indices = np.where(assignment > 0.5)[0]
-        num_users_assigned = len(assigned_user_indices)
-        
-        if num_users_assigned == 0:
-            return 0.0
-        
-        # Calculate achievable rate for each assigned user
-        for idx, user_idx in enumerate(assigned_user_indices):
-            # Channel vector for this user (shape: num_antennas)
-            if user_idx < local_channel.shape[1]:
-                h = local_channel[:, user_idx]
-            else:
+   def calculate_precoding_quality(self, 
+                                precoding: np.ndarray,
+                                local_channel: np.ndarray,
+                                assignment: np.ndarray,
+                                all_precodings: list,      # added
+                                all_channels: list,        # added
+                                interference_factor: float,# added μ_n,k
+                                snr: float = 10.0          # added ρ
+                                ) -> float:
+    quality = 0.0
+    assigned_user_indices = np.where(assignment > 0.5)[0]
+    num_users_assigned = len(assigned_user_indices)
+
+    if num_users_assigned == 0:
+        return 0.0
+
+    num_aps = len(all_precodings)
+
+    for idx, user_idx in enumerate(assigned_user_indices):
+
+        if user_idx >= local_channel.shape[1]:
+            continue
+
+        # Channel and precoding for this AP-user pair
+        h = local_channel[:, user_idx]
+        v = precoding[:, idx] if idx < precoding.shape[1] else precoding[:, 0]
+
+        min_len = min(len(h), len(v))
+        h, v = h[:min_len], v[:min_len]
+
+        # ── Signal power: ρ|h^T_m,k · v_m|²  (numerator of Eq. 4) ──
+        signal_power = snr * (np.abs(np.dot(h.conj(), v)) ** 2)
+
+        # ── Interference: ρ Σ_{n≠m} μ_n,k |h^T_n,k · v_n|²  (Eq. 4) ──
+        interference = 0.0
+        for n in range(num_aps):
+            if n == self.ap_index:        # skip self
                 continue
-            
-            # Precoding vector for this user (shape: num_antennas)
-            if idx < precoding.shape[1]:
-                v = precoding[:, idx]
-            else:
-                # Use first precoding vector if not enough
-                v = precoding[:, 0]
-            
-            # Ensure dimensions match
-            min_len = min(len(h), len(v))
-            h = h[:min_len]
-            v = v[:min_len]
-            
-            # Signal power
-            signal_power = np.abs(np.dot(h.conj(), v)) ** 2
-            
-            # Interference and noise (simplified)
-            noise_power = 1.0
-            
-            # SINR
-            sinr = signal_power / noise_power
-            
-            # Rate in bits/s/Hz
-            rate = np.log2(1 + sinr)
-            quality += rate
-        
-        return quality
+
+            if (n < len(all_channels) and 
+                user_idx < all_channels[n].shape[1] and
+                all_precodings[n] is not None):
+
+                h_n = all_channels[n][:, user_idx]
+                v_n = all_precodings[n]
+
+                # Handle shape: v_n may be matrix, take first column
+                if v_n.ndim > 1:
+                    v_n = v_n[:, 0]
+
+                min_len_n = min(len(h_n), len(v_n))
+                h_n = h_n[:min_len_n]
+                v_n = v_n[:min_len_n]
+
+                interference += interference_factor * snr * \
+                                (np.abs(np.dot(h_n.conj(), v_n)) ** 2)
+
+        # ── SINR and Rate (Eq. 4 & 5) ──
+        noise_power = 1.0                 # normalized σ² = 1
+        sinr        = signal_power / (interference + noise_power)
+        rate        = np.log2(1 + sinr)
+        quality    += rate
+
+    return quality
     
     def calculate_loss(self, precoding: np.ndarray,
                       local_channel: np.ndarray,
