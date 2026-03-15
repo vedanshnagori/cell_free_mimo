@@ -368,22 +368,71 @@ class EdgeQNN:
     return quality
     
     def calculate_loss(self, precoding: np.ndarray,
-                      local_channel: np.ndarray,
-                      assignment: np.ndarray,
-                      target_reward: float) -> float:
-        """
-        Calculate training loss L_precode
-        Corresponds to Eq. (17) in the paper
-        """
-        current_quality = self.calculate_precoding_quality(
-            precoding, local_channel, assignment
-        )
-        
-        # Reward-based loss (Eq. 18)
-        # φ_precode(h_m) = sum log2(1 + λ_j^[m] / σ_j^[m])
-        loss = (target_reward - current_quality) ** 2
-        
-        return loss
+                   local_channel: np.ndarray,
+                   assignment: np.ndarray,
+                   all_precodings: list,
+                   all_channels: list) -> float:
+    """
+    Calculate training loss L_precode
+    Implements Eq. (17): L_precode = ||Q^[m]_precode - Φ_precode(h_m)||²
+
+    Where:
+        Q^[m]_precode = -R_m→k(v_m|γ)          (Eq. 16)
+        Φ_precode     = -Σ log2(1+λ_i/N_λ*ρ)   (Eq. 18)
+
+    Args:
+        precoding:      v_m ∈ C^(N_Tx × N_assigned)
+        local_channel:  h_m ∈ C^(N_Tx × N_user)
+        assignment:     γ_m ∈ {0,1}^N_user
+        all_precodings: {v_n} for all APs (interference)
+        all_channels:   {h_n} for all APs (interference)
+
+    Returns:
+        loss: scalar training loss L_precode
+    """
+
+    # ── Input validation ───────────────────────────────────────────
+    assert precoding.shape[0]     == self.num_antennas, \
+        f"precoding shape {precoding.shape} incompatible " \
+        f"with num_antennas {self.num_antennas}"
+    assert local_channel.shape[0] == self.num_antennas, \
+        f"channel shape {local_channel.shape} incompatible " \
+        f"with num_antennas {self.num_antennas}"
+    assert len(assignment) > 0, \
+        "assignment vector is empty"
+
+    # ── Current reward: Q^[m]_precode = -R_m→k (Eq. 16) ──────────
+    current_quality = self.calculate_precoding_quality(
+        precoding           = precoding,
+        local_channel       = local_channel,
+        assignment          = assignment,
+        all_precodings      = all_precodings,
+        all_channels        = all_channels,
+        interference_factor = self.config.INTERFERENCE_FACTOR,
+        snr                 = self.config.SNR
+    )
+    current_reward = -current_quality      # Q^[m]_precode = -R_m→k
+
+    # ── Target reward: Φ_precode(h_m) from Eq. (18) ───────────────
+    # Φ_precode = -Σ log2(1 + λ^[m]_i / N_λ * ρ)
+    gram_matrix = local_channel @ local_channel.conj().T
+    eigenvalues = np.linalg.eigvalsh(gram_matrix)
+    eigenvalues = np.maximum(eigenvalues, 0)           # numerical stability
+    n_lambda    = max(1, len(eigenvalues))
+
+    target_reward = -sum(
+        np.log2(1 + lam / (n_lambda * self.config.SNR))
+        for lam in eigenvalues
+    )
+
+    # ── Loss: Eq. (17) ─────────────────────────────────────────────
+    # L_precode = ||Q^[m]_precode - Φ_precode||²
+    loss = (current_reward - target_reward) ** 2
+
+    # ── Track loss history for Fig. 6 ─────────────────────────────
+    self.training_losses.append(float(loss))
+
+    return loss
     
     def train(self, local_channel: np.ndarray, assignment: np.ndarray,
              num_iterations: int = 30) -> Dict:
