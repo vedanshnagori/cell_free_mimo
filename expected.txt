@@ -1,0 +1,12 @@
+python test_suite.py
+python main.py
+```
+
+Expected improvements:
+```
+Min Rate  : > 0.5 bits/s/Hz      # improved
+Avg SINR  : > 0 dB               # positive now
+Edge Loss : < 10.0               # much lower
+User 0 → APs [0, 1]             # balanced
+User 1 → APs [2, 3]             # balanced
+User 2 → APs [4, 5]             # balanced
