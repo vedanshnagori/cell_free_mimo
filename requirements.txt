@@ -5,4 +5,8 @@ qiskit-machine-learning==0.7.2
 numpy>=1.24.0
 matplotlib>=3.7.0
 scikit-learn>=1.3.0
+<<<<<<< HEAD
 pylatexenc>=2.10
+=======
+pylatexenc>=2.10
+>>>>>>> 99829bd402f53b1c8256be2d3beb2759f02e5d11
