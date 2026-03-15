@@ -248,7 +248,7 @@ class EdgeQNN:
             for ant_idx in range(self.num_antennas):
                 bit_value = (state_int >> (ant_idx % self.num_qubits)) & 1
                 user_idx  = bit_value % num_cols
-                amplitude = np.sqrt(prob * self.config.SNR)
+                amplitude = np.sqrt(prob) 
                 phase     = (state_int / (2 ** self.num_qubits)) * 2 * np.pi
                 precoding[ant_idx, user_idx] += amplitude * np.exp(1j * phase)
 
