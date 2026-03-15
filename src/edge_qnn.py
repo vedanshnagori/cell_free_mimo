@@ -89,39 +89,30 @@ class EdgeQNN:
     assert self.ansatz.num_parameters > 0, \
         "Ansatz has no trainable parameters — check num_qubits and reps"
 
-    def encode_local_channel(self, local_channel: np.ndarray, 
-                            assignment: np.ndarray) -> np.ndarray:
+    def create_qnn_circuit(self, input_data: np.ndarray, 
+                          parameters: np.ndarray) -> QuantumCircuit:
         """
-        Encode local channel information h_m and assignment γ
-        Corresponds to the input of U^[m] in Eq. (19)
-        
-        Args:
-            local_channel: Channel from this AP to its assigned users
-            assignment: Assignment policy for this AP
+        Create the edge QNN circuit U^[m]
+        Implements Eq. (19) from the paper
         """
-        # Extract relevant channel info and convert complex to real
-        if np.iscomplexobj(local_channel):
-            channel_magnitude = np.abs(local_channel).flatten()
-            channel_phase = np.angle(local_channel).flatten()
-            channel_features = np.concatenate([channel_magnitude, channel_phase])
-        else:
-            channel_features = np.abs(local_channel).flatten()
+        qc = QuantumCircuit(self.num_qubits)
         
-        assignment_features = assignment.flatten()
+        # Encoding layer (Eq. 20 - encoding operation)
+        param_dict = dict(zip(self.feature_map.parameters, input_data))
+        feature_circuit = self.feature_map.assign_parameters(param_dict)
+        feature_circuit = feature_circuit.decompose()
+        qc.compose(feature_circuit, inplace=True)
         
-        # Combine features
-        combined = np.concatenate([channel_features, assignment_features])
+        # Variational layer (Eq. 20 - connection operation)
+        param_dict = dict(zip(self.ansatz.parameters, parameters))
+        ansatz_circuit = self.ansatz.assign_parameters(param_dict)
+        ansatz_circuit = ansatz_circuit.decompose()
+        qc.compose(ansatz_circuit, inplace=True)
         
-        # Truncate or pad to num_qubits
-        if len(combined) < self.num_qubits:
-            encoded = np.pad(combined, (0, self.num_qubits - len(combined)))
-        else:
-            encoded = combined[:self.num_qubits]
+        # Measurements
+        qc.measure_all()
         
-        # Normalize to [-π, π] and ensure real values
-        encoded = np.real(encoded) * np.pi
-        
-        return encoded
+        return qc
     
     def encode_local_channel(self, local_channel: np.ndarray,
                          assignment: np.ndarray) -> np.ndarray:
