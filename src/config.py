@@ -36,8 +36,8 @@ class NetworkConfig:
     # Training parameters (Algorithm 1, Section V, Table III)
     N_DATA               = 100
     N_EPOCH              = 100
-    NUM_ITERATIONS_CLOUD = 50
-    NUM_ITERATIONS_EDGE  = 30
+    NUM_ITERATIONS_CLOUD = 100
+    NUM_ITERATIONS_EDGE  = 100
     LEARNING_RATE        = 0.01    # μ, Table III
 
     # Penalty for unassigned users Eq. (14), Table III
@@ -95,5 +95,5 @@ class QNNConfig:
     R_PENALTY            = -10.0
 
     # Training iterations
-    NUM_ITERATIONS_CLOUD = 50
-    NUM_ITERATIONS_EDGE  = 30
+    NUM_ITERATIONS_CLOUD = 100
+    NUM_ITERATIONS_EDGE  = 100
