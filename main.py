@@ -180,8 +180,8 @@ def main():
         rate = (results['performance']['user_rates'][k]
                 if k < len(results['performance'].get('user_rates', []))
                 else 0.0)
-        print(f"  User {k} → APs {assigned_aps.tolist():20s} "
-              f"Rate={rate:.4f} bits/s/Hz")
+        print(f"  User {k} → APs {str(assigned_aps.tolist()):<20s} "
+      f"Rate={rate:.4f} bits/s/Hz")
 
     print("="*70)
     print("Simulation completed!")
