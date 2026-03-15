@@ -662,30 +662,75 @@ class EdgeQNN:
 
     return gradient
 
-    def predict(self, local_channel: np.ndarray, assignment: np.ndarray) -> np.ndarray:
-        """
-        Use trained edge QNN to predict precoding vectors
-        Deployment phase
-        """
-        if not self.trained:
-            raise ValueError(f"Edge QNN for AP {self.ap_id} must be trained before prediction!")
-        
-        num_users_assigned = int(assignment[self.ap_id].sum())
-        
-        if num_users_assigned == 0:
-            return np.zeros((self.num_antennas, 1), dtype=complex)
-        
-        # Encode input
-        encoded_input = self.encode_local_channel(local_channel, assignment[self.ap_id])
-        
-        # Run circuit
-        simulator = AerSimulator()
-        qc = self.create_qnn_circuit(encoded_input, self.theta_edge)
-        qc = transpile(qc, simulator)
-        result = simulator.run(qc, shots=self.config.SHOTS).result()
-        counts = result.get_counts()
-        
-        # Decode precoding
-        precoding = self.decode_precoding(counts, num_users_assigned)
-        
-        return precoding
+   def predict(self, local_channel: np.ndarray,
+            assignment: np.ndarray) -> np.ndarray:
+    """
+    Deployment phase inference for trained Edge QNN
+    Implements deployment step of Algorithm 1:
+    given γ and ĥ_m, estimate v_m via trained U^[m](θ^[m])
+
+    Args:
+        local_channel: h_m ∈ C^(N_Tx × N_user)
+        assignment:    γ ∈ {0,1}^(N_AP × N_user) or (N_user,)
+
+    Returns:
+        precoding: v_m ∈ C^(N_Tx × N_assigned)
+                   satisfies ||v_m||² ≤ 1 (Eq. 15b)
+    """
+
+    # ── Guard: must be trained first ──────────────────────────────
+    if not self.trained:
+        raise ValueError(
+            f"Edge QNN for AP {self.ap_id} must be trained "
+            f"before prediction"
+        )
+
+    # ── Validate theta_edge ────────────────────────────────────────
+    assert self.theta_edge is not None, \
+        f"theta_edge is None for AP {self.ap_id} — " \
+        f"training may have failed"
+    assert len(self.theta_edge) == self.ansatz.num_parameters, \
+        f"theta_edge length {len(self.theta_edge)} != " \
+        f"ansatz parameters {self.ansatz.num_parameters}"
+
+    # ── Input validation ───────────────────────────────────────────
+    assert local_channel.shape[0] == self.num_antennas, \
+        f"channel shape {local_channel.shape} incompatible " \
+        f"with num_antennas {self.num_antennas}"
+    assert assignment is not None, \
+        "assignment cannot be None in deployment phase"
+
+    # ── Extract this AP's assignment ───────────────────────────────
+    ap_assignment = (assignment[self.ap_id, :]
+                     if assignment.ndim == 2
+                     else assignment)
+
+    num_users_assigned = int(ap_assignment.sum())
+
+    # ── Handle unassigned AP ───────────────────────────────────────
+    if num_users_assigned == 0:
+        print(f"  Warning: No users assigned to AP {self.ap_id} "
+              f"— returning zero precoding")
+        return np.zeros((self.num_antennas, 1), dtype=complex)
+
+    # ── Step 1: encode {h_m, γ_m} → rotation angles ───────────────
+    encoded_input = self.encode_local_channel(
+        local_channel, ap_assignment
+    )
+
+    # ── Step 2: run trained circuit U^[m](θ^[m]) ──────────────────
+    qc = self.create_qnn_circuit(encoded_input, self.theta_edge)
+
+    # only transpile for real hardware backends
+    if self.config.BACKEND != 'qasm_simulator':
+        qc = transpile(qc, self.simulator)
+
+    counts = self.simulator.run(
+        qc, shots=self.config.SHOTS
+    ).result().get_counts()
+
+    # ── Step 3: decode counts → v_m ───────────────────────────────
+    # satisfies ||v_m||² ≤ 1 via normalization in decode_precoding
+    precoding = self.decode_precoding(counts, num_users_assigned)
+
+    return precoding
