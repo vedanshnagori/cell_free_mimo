@@ -19,17 +19,30 @@ class EdgeQNN:
     """
     
     def __init__(self, ap_id: int, num_antennas: int, config: QNNConfig):
-        self.ap_id = ap_id
-        self.num_antennas = num_antennas
-        self.config = config
-        self.num_qubits = config.NUM_QUBITS_EDGE
-        
-        # Initialize parameters
-        self.theta_edge = None
-        self.trained = False
-        
-        # Setup quantum circuit
-        self._setup_circuit()
+    self.ap_id    = ap_id
+    self.ap_index = ap_id      # explicit index for interference loop
+    self.num_antennas = num_antennas
+    self.config   = config
+    self.num_qubits = config.NUM_QUBITS_EDGE
+
+    # Setup quantum circuit first (needed for parameter count)
+    self._setup_circuit()
+
+    # Initialize parameters AFTER _setup_circuit()
+    # so ansatz.num_parameters is available
+    self.theta_edge = np.random.uniform(
+        low  = -np.pi,
+        high =  np.pi,
+        size =  self.ansatz.num_parameters
+    )
+
+    # Training state
+    self.trained         = False
+    self.current_episode = 0          # for descending lr: μ/√(episode+1)
+    self.learning_rate   = config.LEARNING_RATE
+
+    # Training history for loss tracking (Fig. 6)
+    self.training_losses = []
         
     def _setup_circuit(self):
         """Setup the quantum circuit for edge QNN"""
