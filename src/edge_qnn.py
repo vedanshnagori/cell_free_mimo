@@ -123,30 +123,75 @@ class EdgeQNN:
         
         return encoded
     
-    def create_qnn_circuit(self, input_data: np.ndarray, 
-                          parameters: np.ndarray) -> QuantumCircuit:
-        """
-        Create the edge QNN circuit U^[m]
-        Implements Eq. (19) from the paper
-        """
-        qc = QuantumCircuit(self.num_qubits)
-        
-        # Encoding layer (Eq. 20 - encoding operation)
-        param_dict = dict(zip(self.feature_map.parameters, input_data))
-        feature_circuit = self.feature_map.assign_parameters(param_dict)
-        feature_circuit = feature_circuit.decompose()
-        qc.compose(feature_circuit, inplace=True)
-        
-        # Variational layer (Eq. 20 - connection operation)
-        param_dict = dict(zip(self.ansatz.parameters, parameters))
-        ansatz_circuit = self.ansatz.assign_parameters(param_dict)
-        ansatz_circuit = ansatz_circuit.decompose()
-        qc.compose(ansatz_circuit, inplace=True)
-        
-        # Measurements
-        qc.measure_all()
-        
-        return qc
+    def encode_local_channel(self, local_channel: np.ndarray,
+                         assignment: np.ndarray) -> np.ndarray:
+    """
+    Encode local channel information h_m and assignment γ
+    Corresponds to input of U^[m] in Eq. (19)
+    Input: {h_m,k, γ_m} → output: rotation angles ∈ [-π, π]
+
+    Args:
+        local_channel: Channel h_m ∈ C^(N_Tx × N_user), shape (num_antennas, num_users)
+        assignment:    Assignment γ_m ∈ {0,1}^N_user,   shape (num_users,)
+
+    Returns:
+        encoded: rotation angles ∈ [-π, π], shape (num_qubits,)
+    """
+
+    # ── Input validation ───────────────────────────────────────────
+    assert local_channel.shape[0] == self.num_antennas, \
+        f"Channel shape {local_channel.shape} incompatible " \
+        f"with num_antennas {self.num_antennas}"
+    assert len(assignment) > 0, \
+        "Assignment vector is empty"
+
+    # ── Step 1: Complex → Real features ───────────────────────────
+    # Normalize magnitude and phase separately to preserve structure
+    if np.iscomplexobj(local_channel):
+        channel_magnitude = np.abs(local_channel).flatten()
+        channel_magnitude = channel_magnitude / \
+                           (np.max(channel_magnitude) + 1e-10)  # → [0, 1]
+
+        channel_phase = np.angle(local_channel).flatten()
+        channel_phase = channel_phase / np.pi                   # → [-1, 1]
+
+        channel_features = np.concatenate([channel_magnitude, channel_phase])
+    else:
+        channel_features = np.abs(local_channel).flatten()
+        channel_features = channel_features / \
+                          (np.max(channel_features) + 1e-10)    # → [0, 1]
+
+    # ── Step 2: Assignment features ────────────────────────────────
+    # clip handles soft assignment outputs from cloud QNN
+    assignment_features = np.clip(assignment.flatten(), 0.0, 1.0)
+
+    # ── Step 3: Combine features ───────────────────────────────────
+    combined = np.concatenate([channel_features, assignment_features])
+
+    # ── Step 4: Dimensionality reduction to num_qubits ─────────────
+    # mean pooling preserves overall feature distribution
+    if len(combined) < self.num_qubits:
+        # pad with zeros if too few features
+        encoded = np.pad(combined, (0, self.num_qubits - len(combined)))
+    else:
+        # mean pooling: group features evenly across qubits
+        chunk_size = max(1, len(combined) // self.num_qubits)
+        encoded = np.array([
+            np.mean(combined[i:i + chunk_size])
+            for i in range(0, self.num_qubits * chunk_size, chunk_size)
+        ])
+        # handle any remainder
+        if len(encoded) < self.num_qubits:
+            encoded = np.pad(encoded, (0, self.num_qubits - len(encoded)))
+        encoded = encoded[:self.num_qubits]
+
+    # ── Step 5: Scale to rotation angles [-π, π] ──────────────────
+    max_val = np.max(np.abs(encoded))
+    if max_val > 1e-10:
+        encoded = encoded / max_val         # normalize to [-1, 1]
+    encoded = np.real(encoded) * np.pi      # scale to [-π, π]
+
+    return encoded
     
     def decode_precoding(self, counts: Dict[str, int], 
                         num_users_assigned: int) -> np.ndarray:
