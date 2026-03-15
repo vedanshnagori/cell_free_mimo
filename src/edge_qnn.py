@@ -88,31 +88,6 @@ class EdgeQNN:
         "Feature map has no parameters — check feature_dimension and reps"
     assert self.ansatz.num_parameters > 0, \
         "Ansatz has no trainable parameters — check num_qubits and reps"
-
-    def create_qnn_circuit(self, input_data: np.ndarray, 
-                          parameters: np.ndarray) -> QuantumCircuit:
-        """
-        Create the edge QNN circuit U^[m]
-        Implements Eq. (19) from the paper
-        """
-        qc = QuantumCircuit(self.num_qubits)
-        
-        # Encoding layer (Eq. 20 - encoding operation)
-        param_dict = dict(zip(self.feature_map.parameters, input_data))
-        feature_circuit = self.feature_map.assign_parameters(param_dict)
-        feature_circuit = feature_circuit.decompose()
-        qc.compose(feature_circuit, inplace=True)
-        
-        # Variational layer (Eq. 20 - connection operation)
-        param_dict = dict(zip(self.ansatz.parameters, parameters))
-        ansatz_circuit = self.ansatz.assign_parameters(param_dict)
-        ansatz_circuit = ansatz_circuit.decompose()
-        qc.compose(ansatz_circuit, inplace=True)
-        
-        # Measurements
-        qc.measure_all()
-        
-        return qc
     
     def encode_local_channel(self, local_channel: np.ndarray,
                          assignment: np.ndarray) -> np.ndarray:
@@ -183,6 +158,73 @@ class EdgeQNN:
     encoded = np.real(encoded) * np.pi      # scale to [-π, π]
 
     return encoded
+
+    def create_qnn_circuit(self, input_data: np.ndarray,
+                       parameters: np.ndarray) -> QuantumCircuit:
+    """
+    Create the edge QNN circuit U^[m]
+    Implements Eq. (19): U^[m] = U^[m]_connect(θ^[m]) · U^[m]_encode(Ĥ)
+
+    Args:
+        input_data:  encoded channel features, shape (feature_map.num_parameters,)
+                     output of encode_local_channel()
+        parameters:  trainable weights θ^[m],  shape (ansatz.num_parameters,)
+                     updated during Algorithm 3 training
+
+    Returns:
+        qc: QuantumCircuit with measurements
+    """
+
+    # ── Guard: ensure circuit is set up ───────────────────────────
+    assert self.feature_map is not None, \
+        "feature_map is None — call _setup_circuit() first"
+    assert self.ansatz is not None, \
+        "ansatz is None — call _setup_circuit() first"
+
+    # ── Input validation ───────────────────────────────────────────
+    assert len(input_data) == len(self.feature_map.parameters), \
+        f"input_data length {len(input_data)} != " \
+        f"feature_map parameters {len(self.feature_map.parameters)}"
+
+    assert len(parameters) == len(self.ansatz.parameters), \
+        f"parameters length {len(parameters)} != " \
+        f"ansatz parameters {len(self.ansatz.parameters)}"
+
+    # ── Initialize circuit: |0⟩^⊗N_user (Eq. 19) ─────────────────
+    cr = ClassicalRegister(self.num_qubits, name='edge_output')
+    qc = QuantumCircuit(self.num_qubits)
+    qc.add_register(cr)
+
+    # ── Encoding layer: U^[m]_encode(Ĥ) ──────────────────────────
+    # encodes {h_m,k, γ_m} into Hilbert space (Eq. 19)
+    param_dict      = dict(zip(self.feature_map.parameters, input_data))
+    feature_circuit = self.feature_map.assign_parameters(param_dict)
+
+    # only decompose for non-statevector backends
+    if self.config.BACKEND != 'statevector_simulator':
+        feature_circuit = feature_circuit.decompose()
+
+    qc.compose(feature_circuit, inplace=True)
+    qc.barrier()                    # separates U_encode | U_connect
+
+    # ── Variational layer: U^[m]_connect(θ^[m]) ───────────────────
+    # trainable RY rotations + CZ entangling gates (Eq. 20)
+    # parameters θ^[m] updated via parameter shift rule (Appendix B)
+    param_dict     = dict(zip(self.ansatz.parameters, parameters))
+    ansatz_circuit = self.ansatz.assign_parameters(param_dict)
+
+    if self.config.BACKEND != 'statevector_simulator':
+        ansatz_circuit = ansatz_circuit.decompose()
+
+    qc.compose(ansatz_circuit, inplace=True)
+    qc.barrier()                    # separates U_connect | measurement
+
+    # ── Measurement → classical output ────────────────────────────
+    # collapses quantum state to classical bits
+    # decoded by decode_precoding() into v_m ∈ C^(N_Tx)
+    qc.measure(range(self.num_qubits), range(self.num_qubits))
+
+    return qc
     
     def decode_precoding(self, counts: Dict[str, int], 
                         num_users_assigned: int) -> np.ndarray:
