@@ -226,52 +226,81 @@ class EdgeQNN:
 
     return qc
     
-    def decode_precoding(self, counts: Dict[str, int], 
-                        num_users_assigned: int) -> np.ndarray:
-        """
-        Decode quantum output to precoding vector v_m
-        
-        Args:
-            counts: Measurement results
-            num_users_assigned: Number of users assigned to this AP
-        
-        Returns:
-            Precoding vector (complex values)
-        """
-        # Convert counts to probabilities
-        total_shots = sum(counts.values())
-        
-        # Initialize precoding matrix [num_antennas x max(1, num_users_assigned)]
-        # Ensure at least 1 column even if no users assigned
-        num_cols = max(1, num_users_assigned)
-        precoding = np.zeros((self.num_antennas, num_cols), dtype=complex)
-        
-        # Decode measurement outcomes to precoding coefficients
-        for bitstring, count in counts.items():
-            prob = count / total_shots
-            state_int = int(bitstring[::-1], 2)
-            
-            # Map quantum state to precoding coefficients
-            for ant_idx in range(self.num_antennas):
-                user_idx = ant_idx % num_cols
-                
-                # Extract phase and amplitude from quantum state
-                phase = (state_int & 0xFF) * 2 * np.pi / 256
-                amplitude = np.sqrt(prob)
-                
-                precoding[ant_idx, user_idx] += amplitude * np.exp(1j * phase)
-        
-        # Normalize precoding vectors
-        for user_idx in range(num_cols):
-            norm = np.linalg.norm(precoding[:, user_idx])
-            if norm > 1e-10:
-                precoding[:, user_idx] /= norm
-            else:
-                # If norm is too small, use random unit vector
-                precoding[:, user_idx] = np.random.randn(self.num_antennas) + 1j * np.random.randn(self.num_antennas)
-                precoding[:, user_idx] /= np.linalg.norm(precoding[:, user_idx])
-        
-        return precoding
+    def decode_precoding(self, counts: Dict[str, int],
+                     num_users_assigned: int) -> np.ndarray:
+    """
+    Decode quantum measurement output to precoding vector v_m
+    Corresponds to measurement step after U^[m] in Eq. (19)
+    Output satisfies energy constraint ||v_m||² ≤ 1 (Eq. 15b)
+
+    Args:
+        counts:             Qiskit measurement results {bitstring: count}
+        num_users_assigned: number of users assigned to this AP via γ_m
+
+    Returns:
+        precoding: v_m ∈ C^(N_Tx × N_assigned), normalized per Eq. (15b)
+    """
+
+    # ── Input validation ───────────────────────────────────────────
+    total_shots = sum(counts.values())
+    assert len(counts)   > 0, \
+        "counts is empty — circuit may have failed"
+    assert total_shots   > 0, \
+        "total_shots is zero — no measurements recorded"
+    assert num_users_assigned >= 0, \
+        f"num_users_assigned {num_users_assigned} cannot be negative"
+
+    # ── Initialize precoding matrix ────────────────────────────────
+    # shape: (N_Tx × N_assigned), at least 1 column
+    num_cols  = max(1, num_users_assigned)
+    precoding = np.zeros((self.num_antennas, num_cols), dtype=complex)
+
+    # minimum probability threshold — skip negligible states
+    min_prob  = 1.0 / self.config.SHOTS
+
+    # ── Decode measurement outcomes ────────────────────────────────
+    for bitstring, count in counts.items():
+        prob = count / total_shots
+
+        # skip negligible probability states (noise)
+        if prob < min_prob:
+            continue
+
+        # fix Qiskit little-endian bit ordering
+        state_int = int(bitstring[::-1], 2)
+
+        for ant_idx in range(self.num_antennas):
+
+            # ── User mapping via qubit bit value ───────────────
+            # each qubit → one user (Lemma 1: Nuser qubits)
+            bit_value = (state_int >> (ant_idx % self.num_qubits)) & 1
+            user_idx  = bit_value % num_cols
+
+            # ── Amplitude from Born rule + SNR scaling ─────────
+            # links to ρ|h^T_m,k v_m|² in Eq. (4)
+            amplitude = np.sqrt(prob * self.config.SNR)
+
+            # ── Phase from full state space ────────────────────
+            # maps [0, 2^N_qubits] → [0, 2π]
+            phase = (state_int / (2 ** self.num_qubits)) * 2 * np.pi
+
+            precoding[ant_idx, user_idx] += amplitude * np.exp(1j * phase)
+
+    # ── Normalize: enforce ||v_m||² ≤ 1 (Eq. 15b) ────────────────
+    rng = np.random.default_rng(self.config.RANDOM_SEED)
+
+    for user_idx in range(num_cols):
+        norm = np.linalg.norm(precoding[:, user_idx])
+
+        if norm > 1e-10:
+            precoding[:, user_idx] /= norm          # unit norm
+        else:
+            # fallback: seeded random unit vector
+            fallback = (rng.standard_normal(self.num_antennas) +
+                       1j * rng.standard_normal(self.num_antennas))
+            precoding[:, user_idx] = fallback / np.linalg.norm(fallback)
+
+    return precoding
     
    def calculate_precoding_quality(self, 
                                 precoding: np.ndarray,
