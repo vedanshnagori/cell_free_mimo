@@ -10,9 +10,7 @@ import os
 import numpy as np
 import json
 from datetime import datetime
-
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-
 from config import NetworkConfig, QNNConfig
 from multi_stage_qnn import MultiStageQNN
 

@@ -197,10 +197,10 @@ class CloudQNN:
         return self._normalize_assignment(assignment)
 
     def _normalize_assignment(self, assignment: np.ndarray) -> np.ndarray:
-    """
-    Enforce Eq. (6c): each user gets at least one AP
-    But limit max APs per user to avoid imbalance
-    """
+        """
+        Enforce Eq. (6c): each user gets at least one AP
+        But limit max APs per user to avoid imbalance
+        """
         normalized = np.zeros_like(assignment)
 
         # max APs per user = NAP / Nuser  (balanced distribution)
